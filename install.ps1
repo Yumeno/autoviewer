@@ -27,7 +27,7 @@ function Invoke-CheckedCommand {
 }
 
 Write-Host "=========================================="
-Write-Host "Auto Image Viewer startup"
+Write-Host "Auto Image Viewer install"
 Write-Host "=========================================="
 
 try {
@@ -36,11 +36,6 @@ try {
     $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
     if (-not $pythonCommand) {
         Show-FatalError "Python was not found. Install Python first and enable 'Add python.exe to PATH'."
-    }
-
-    $viewerPath = Join-Path $PSScriptRoot "viewer.py"
-    if (-not (Test-Path -LiteralPath $viewerPath)) {
-        Show-FatalError "viewer.py was not found in $PSScriptRoot."
     }
 
     $requirementsPath = Join-Path $PSScriptRoot "requirements.txt"
@@ -54,14 +49,17 @@ try {
     Invoke-CheckedCommand -FilePath "python" -Arguments @("--version")
 
     if (-not (Test-Path -LiteralPath $venvPython)) {
-        Write-Host "Local virtual environment was not found. Bootstrapping .venv..."
+        Write-Host "Creating local virtual environment..."
         Invoke-CheckedCommand -FilePath "python" -Arguments @("-m", "venv", $venvPath)
-        Invoke-CheckedCommand -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
-        Invoke-CheckedCommand -FilePath $venvPython -Arguments @("-m", "pip", "install", "-r", $requirementsPath)
     }
 
-    Write-Host "Launching viewer..."
-    Invoke-CheckedCommand -FilePath $venvPython -Arguments @($viewerPath)
+    Write-Host "Installing required packages into .venv..."
+    Invoke-CheckedCommand -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
+    Invoke-CheckedCommand -FilePath $venvPython -Arguments @("-m", "pip", "install", "-r", $requirementsPath)
+
+    Write-Host ""
+    Write-Host "Install completed. Virtual environment: .venv"
+    Read-Host "Press Enter to exit"
 }
 catch {
     Show-FatalError $_.Exception.Message

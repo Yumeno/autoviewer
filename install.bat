@@ -6,20 +6,13 @@ set "VENV_DIR=.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
 echo ==========================================
-echo Auto Image Viewer startup
+echo Auto Image Viewer install
 echo ==========================================
 
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     color 4F
     echo [ERROR] Python was not found. Install Python first and enable "Add python.exe to PATH".
-    pause
-    exit /b 1
-)
-
-if not exist viewer.py (
-    color 4F
-    echo [ERROR] viewer.py was not found.
     pause
     exit /b 1
 )
@@ -32,7 +25,7 @@ if not exist requirements.txt (
 )
 
 if not exist "%VENV_PYTHON%" (
-    echo Local virtual environment was not found. Bootstrapping .venv...
+    echo Creating local virtual environment...
     python -m venv "%VENV_DIR%"
     if %errorlevel% neq 0 (
         color 4F
@@ -40,23 +33,25 @@ if not exist "%VENV_PYTHON%" (
         pause
         exit /b 1
     )
-
-    "%VENV_PYTHON%" -m pip install --upgrade pip
-    if %errorlevel% neq 0 (
-        color 4F
-        echo [ERROR] Failed to upgrade pip in %VENV_DIR%.
-        pause
-        exit /b 1
-    )
-
-    "%VENV_PYTHON%" -m pip install -r requirements.txt
-    if %errorlevel% neq 0 (
-        color 4F
-        echo [ERROR] Failed to install required packages into %VENV_DIR%.
-        pause
-        exit /b 1
-    )
 )
 
-echo Launching viewer...
-"%VENV_PYTHON%" viewer.py
+echo Installing required packages into %VENV_DIR%...
+"%VENV_PYTHON%" -m pip install --upgrade pip
+if %errorlevel% neq 0 (
+    color 4F
+    echo [ERROR] Failed to upgrade pip in %VENV_DIR%.
+    pause
+    exit /b 1
+)
+
+"%VENV_PYTHON%" -m pip install -r requirements.txt
+if %errorlevel% neq 0 (
+    color 4F
+    echo [ERROR] Failed to install required packages into %VENV_DIR%.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Install completed. Virtual environment: %VENV_DIR%
+pause
