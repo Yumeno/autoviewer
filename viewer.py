@@ -38,6 +38,7 @@ class ImageViewerApp:
         self.current_index = -1
         self.interval_ms = 5000  # デフォルト5秒
         self.is_playing = True
+        self.is_slideshow_active = False
         self.is_fullscreen = False
         self.after_id = None
         
@@ -52,6 +53,7 @@ class ImageViewerApp:
         self.setup_ui()
         self.sync_interval_ui()
         self.update_play_pause_button()
+        self.update_fullscreen_button()
         
         # キーバインド
         self.root.bind("<Escape>", self.exit_fullscreen)
@@ -93,6 +95,14 @@ class ImageViewerApp:
         controls_frame = tk.Frame(self.seekbar_frame, bg='#222222')
         controls_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
 
+        self.fullscreen_button = tk.Button(
+            controls_frame,
+            text="最大化解除",
+            width=10,
+            command=self.toggle_fullscreen_mode
+        )
+        self.fullscreen_button.pack(side=tk.LEFT, padx=(0, 10))
+
         self.play_pause_button = tk.Button(
             controls_frame,
             text="一時停止",
@@ -111,12 +121,21 @@ class ImageViewerApp:
             bg='#222222'
         ).pack(side=tk.LEFT)
 
-        tk.Button(
+        self.close_panel_button = tk.Button(
             controls_frame,
             text="閉じる",
             width=8,
             command=self.toggle_seekbar
-        ).pack(side=tk.RIGHT)
+        )
+        self.close_panel_button.pack(side=tk.RIGHT)
+
+        self.change_folder_button = tk.Button(
+            controls_frame,
+            text="フォルダ変更",
+            width=12,
+            command=self.change_folder_during_slideshow
+        )
+        self.change_folder_button.pack(side=tk.RIGHT, padx=(0, 10))
 
         self.interval_scale_var = tk.DoubleVar()
         self.interval_scale = tk.Scale(
@@ -158,14 +177,18 @@ class ImageViewerApp:
         tk.Button(self.menu_frame, text="2. スライドショー開始", command=self.start_slideshow, width=20, bg='#4CAF50', fg='white').pack(pady=20)
 
         # 操作説明
-        help_text = "【操作方法】\n・Escキー: 設定画面に戻る\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示"
+        help_text = "【操作方法】\n・Escキー: 設定画面に戻る\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 最大化切替 / フォルダ変更"
         tk.Label(self.menu_frame, text=help_text, fg='#AAAAAA', bg='#333333', justify=tk.LEFT).pack(pady=10)
 
     def select_folder(self):
         folder = filedialog.askdirectory()
         if folder:
-            self.folder_path = folder
-            self.folder_var.set(f"選択中: {self.folder_path}")
+            self.set_folder(folder)
+
+    def set_folder(self, folder):
+        """対象フォルダの状態表示を更新"""
+        self.folder_path = folder
+        self.folder_var.set(f"選択中: {self.folder_path}")
 
     def format_interval_seconds(self, seconds):
         """表示用に秒数を整形"""
@@ -189,6 +212,25 @@ class ImageViewerApp:
         else:
             self.play_pause_button.config(text="再開", bg='#FF9800')
 
+    def update_fullscreen_button(self):
+        """フルスクリーン状態に合わせてボタン表示を更新"""
+        if self.is_fullscreen:
+            self.fullscreen_button.config(text="最大化解除")
+        else:
+            self.fullscreen_button.config(text="最大化")
+
+    def clear_image_queue(self):
+        """未処理の監視イベントを破棄"""
+        while not self.image_queue.empty():
+            self.image_queue.get_nowait()
+
+    def stop_observer(self):
+        """フォルダ監視を停止"""
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+            self.observer = None
+
     def cancel_scheduled_image(self):
         """予約済みの自動送りを解除"""
         if self.after_id:
@@ -199,7 +241,7 @@ class ImageViewerApp:
         """次の自動送りを予約"""
         self.cancel_scheduled_image()
 
-        if self.is_playing and self.is_fullscreen:
+        if self.is_playing and self.is_slideshow_active:
             next_delay = self.interval_ms if delay_ms is None else delay_ms
             self.after_id = self.root.after(next_delay, self.next_image)
 
@@ -244,15 +286,50 @@ class ImageViewerApp:
 
     def start_observer(self):
         """フォルダ監視の開始"""
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
+        self.stop_observer()
+        self.clear_image_queue()
         
         if self.folder_path:
             event_handler = NewImageHandler(self.image_queue)
             self.observer = Observer()
             self.observer.schedule(event_handler, self.folder_path, recursive=False)
             self.observer.start()
+
+    def set_fullscreen_state(self, enabled):
+        """フルスクリーン状態を切り替える"""
+        self.is_fullscreen = enabled
+        self.root.attributes("-fullscreen", enabled)
+        self.update_fullscreen_button()
+
+    def refresh_current_folder(self):
+        """現在の対象フォルダを読み直して監視対象も更新"""
+        self.load_images_from_folder()
+        self.update_seekbar_range()
+        self.start_observer()
+        self.current_index = -1
+
+        if self.image_list:
+            self.show_image(0)
+            self.schedule_next_image()
+        else:
+            self.image_label.config(image='')
+            self.current_index = -1
+            self.seekbar_var.set(1)
+            self.cancel_scheduled_image()
+            if self.is_slideshow_active:
+                messagebox.showinfo("情報", "選択したフォルダに画像が見つかりませんでしたが、待機モードに入ります。\n画像が追加されると表示されます。")
+
+    def change_folder_during_slideshow(self):
+        """再生中に対象フォルダを切り替える"""
+        if not self.is_slideshow_active:
+            return
+
+        folder = filedialog.askdirectory(initialdir=self.folder_path or None)
+        if not folder:
+            return
+
+        self.set_folder(folder)
+        self.refresh_current_folder()
 
     def start_slideshow(self):
         """スライドショーの開始"""
@@ -270,27 +347,19 @@ class ImageViewerApp:
             return
 
         self.sync_interval_ui()
-        self.load_images_from_folder()
-        if not self.image_list:
-            messagebox.showinfo("情報", "選択したフォルダに画像が見つかりませんでしたが、待機モードに入ります。\n画像が追加されると表示されます。")
-        
-        self.update_seekbar_range()
-        self.start_observer()
         self.menu_frame.place_forget()  # メニューを隠す
         
-        # フルスクリーン化
-        self.is_fullscreen = True
-        self.root.attributes("-fullscreen", True)
-        
+        self.is_slideshow_active = True
         self.current_index = -1
         self.is_playing = True
         self.update_play_pause_button()
-        self.next_image()
+        self.set_fullscreen_state(True)
+        self.refresh_current_folder()
 
     def exit_fullscreen(self, event=None):
         """フルスクリーン解除・設定メニュー表示"""
-        self.is_fullscreen = False
-        self.root.attributes("-fullscreen", False)
+        self.is_slideshow_active = False
+        self.set_fullscreen_state(False)
         self.menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         
         if self.seekbar_visible:
@@ -301,10 +370,8 @@ class ImageViewerApp:
         self.cancel_scheduled_image()
         
         # 監視も一時停止
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
+        self.stop_observer()
+        self.clear_image_queue()
 
     def show_image(self, index):
         """指定したインデックスの画像を表示"""
@@ -396,7 +463,7 @@ class ImageViewerApp:
 
     def toggle_seekbar(self):
         """再生中の操作パネルの表示・非表示を切り替える"""
-        if not self.is_fullscreen:
+        if not self.is_slideshow_active:
             return
             
         if self.seekbar_visible:
@@ -423,6 +490,13 @@ class ImageViewerApp:
         self.sync_interval_ui()
         self.schedule_next_image()
 
+    def toggle_fullscreen_mode(self):
+        """再生中のままフルスクリーン状態を切り替える"""
+        if not self.is_slideshow_active:
+            return
+
+        self.set_fullscreen_state(not self.is_fullscreen)
+
     def next_image(self):
         """次の画像を表示"""
         self.cancel_scheduled_image()
@@ -448,7 +522,7 @@ class ImageViewerApp:
 
     def toggle_play(self, event=None):
         """再生/一時停止の切り替え"""
-        if not self.is_fullscreen:
+        if not self.is_slideshow_active:
             return
             
         self.is_playing = not self.is_playing
@@ -480,7 +554,7 @@ class ImageViewerApp:
                 self.update_seekbar_range()
                 
                 # もし現在最後の画像を表示中で待機状態だったなら、すぐ新しい画像へ進む
-                if self.is_fullscreen and self.is_playing and should_resume_from_wait:
+                if self.is_slideshow_active and self.is_playing and should_resume_from_wait:
                     if self.current_index == -1 or self.current_index < len(self.image_list) - 1:
                         # 500ms待ってから表示（ファイルの書き込み完了を待つため）
                         self.schedule_next_image(delay_ms=500)
@@ -490,9 +564,7 @@ class ImageViewerApp:
 
     def on_closing(self):
         """アプリ終了時の処理"""
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
+        self.stop_observer()
         self.root.destroy()
 
 if __name__ == "__main__":
