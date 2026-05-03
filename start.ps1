@@ -1,25 +1,60 @@
-# 実行ポリシーを一時的にバイパスしてスクリプトを実行できるようにする
 $ErrorActionPreference = "Stop"
 
-Write-Host "=========================================="
-Write-Host "画像ビューアー 起動準備中..."
-Write-Host "=========================================="
+function Show-FatalError {
+    param(
+        [string]$Message
+    )
 
-# Pythonがインストールされているか確認
-try {
-    $test = python --version
-} catch {
-    Write-Host "[エラー] Pythonが見つかりません。Pythonをインストールしてから再度実行してください。" -ForegroundColor Red
-    Write-Host "※インストール時、「Add python.exe to PATH」にチェックを入れてください。"
-    Read-Host "Enterキーを押して終了します"
-    exit
+    Write-Host ""
+    Write-Host "[ERROR] $Message" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit 1
 }
 
-# 必要なライブラリのインストール
-Write-Host "必要な機能（Pillow, watchdog）を確認・インストールしています..."
-python -m pip install --upgrade pip | Out-Null
-python -m pip install Pillow watchdog
+function Invoke-CheckedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
 
-# アプリケーションの起動
-Write-Host "準備完了！ビューアーを起動します。"
-python viewer.py
+        [string[]]$Arguments = @()
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        $argText = $Arguments -join " "
+        throw ("Command failed with exit code {0}: {1} {2}" -f $LASTEXITCODE, $FilePath, $argText)
+    }
+}
+
+Write-Host "=========================================="
+Write-Host "Auto Image Viewer startup"
+Write-Host "=========================================="
+
+try {
+    Push-Location $PSScriptRoot
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCommand) {
+        Show-FatalError "Python was not found. Install Python first and enable 'Add python.exe to PATH'."
+    }
+
+    Invoke-CheckedCommand -FilePath "python" -Arguments @("--version")
+
+    $viewerPath = Join-Path $PSScriptRoot "viewer.py"
+    if (-not (Test-Path -LiteralPath $viewerPath)) {
+        Show-FatalError "viewer.py was not found in $PSScriptRoot."
+    }
+
+    Write-Host "Installing required packages (Pillow, watchdog)..."
+    Invoke-CheckedCommand -FilePath "python" -Arguments @("-m", "pip", "install", "--upgrade", "pip")
+    Invoke-CheckedCommand -FilePath "python" -Arguments @("-m", "pip", "install", "Pillow", "watchdog")
+
+    Write-Host "Launching viewer..."
+    Invoke-CheckedCommand -FilePath "python" -Arguments @($viewerPath)
+}
+catch {
+    Show-FatalError $_.Exception.Message
+}
+finally {
+    Pop-Location -ErrorAction SilentlyContinue
+}

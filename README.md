@@ -20,6 +20,9 @@
 2. 黒い画面が立ち上がり、初回起動時は自動で必要な拡張機能（Pillow, watchdog）をインストールします。  
 3. 準備が完了すると、自動的に設定画面が立ち上がります。
 
+PowerShell から起動する場合は、`start.ps1` を直接ダブルクリックするのではなく、次のコマンドで実行してください。  
+`powershell -ExecutionPolicy Bypass -File .\start.ps1`
+
 ## **使い方**
 
 ### **1\. 設定画面**
