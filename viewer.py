@@ -66,6 +66,7 @@ class ImageViewerApp:
         self.resize_after_id = None
         self.resize_preview_after_id = None
         self.is_live_resizing = False
+        self.panels_hidden_for_resize = False
         self.thumbnail_scroll_after_id = None
         self.thumbnail_follow_path = None
         self.last_root_size = None
@@ -446,7 +447,10 @@ class ImageViewerApp:
             self.update_metadata_button()
             return
 
-        if self.metadata_visible:
+        show_metadata_overlay = self.metadata_visible and not self.panels_hidden_for_resize
+        show_thumbnail_strip = self.thumbnail_visible and not self.panels_hidden_for_resize
+
+        if show_metadata_overlay:
             self.update_metadata_overlay_geometry()
             if not self.metadata_overlay_visible:
                 self.metadata_overlay.deiconify()
@@ -456,7 +460,7 @@ class ImageViewerApp:
             self.metadata_overlay.withdraw()
             self.metadata_overlay_visible = False
 
-        if self.thumbnail_visible:
+        if show_thumbnail_strip:
             self.thumbnail_frame.grid()
         else:
             self.thumbnail_frame.grid_remove()
@@ -684,11 +688,12 @@ finally {{
         if not size_changed:
             return
 
-        if self.metadata_visible and self.metadata_overlay_visible:
-            self.update_metadata_overlay_geometry()
-            self.metadata_overlay.lift(self.root)
-
+        resize_just_started = not self.is_live_resizing
         self.is_live_resizing = True
+        if resize_just_started:
+            self.panels_hidden_for_resize = True
+            self.apply_panel_layout()
+
         if self.current_source_image is not None and self.resize_preview_after_id is None:
             self.resize_preview_after_id = self.root.after_idle(self.flush_resize_preview)
 
@@ -716,7 +721,13 @@ finally {{
             return
 
         self.is_live_resizing = False
-        self.request_render(image=True)
+        self.panels_hidden_for_resize = False
+        self.request_render(
+            layout=True,
+            image=True,
+            metadata=self.metadata_visible,
+            thumbnail_highlight=self.thumbnail_visible,
+        )
 
     def update_metadata_overlay_geometry(self):
         """右端オーバーレイ情報欄の位置とサイズを更新"""
@@ -1090,6 +1101,7 @@ finally {{
             self.root.after_cancel(self.resize_preview_after_id)
             self.resize_preview_after_id = None
         self.is_live_resizing = False
+        self.panels_hidden_for_resize = False
         
         # 自動再生のタイマーをキャンセル
         self.cancel_scheduled_image()
