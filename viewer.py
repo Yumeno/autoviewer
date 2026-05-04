@@ -3,17 +3,50 @@ import subprocess
 import sys
 import time
 import queue
+import ctypes
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ExifTags, UnidentifiedImageError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+if sys.platform.startswith("win"):
+    from ctypes import wintypes
+
 # 対応する画像フォーマット
 SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
 MIN_INTERVAL_SECONDS = 1.0
 MAX_INTERVAL_SECONDS = 30.0
 INTERVAL_STEP_SECONDS = 0.5
+DEBUG_RESIZE_LOG = os.environ.get("AUTOVIEWER_DEBUG_RESIZE") == "1"
+DEBUG_OVERLAY_DISABLE_ALPHA = os.environ.get("AUTOVIEWER_DEBUG_OVERLAY_DISABLE_ALPHA") == "1"
+DEBUG_OVERLAY_DISABLE_TRANSIENT = os.environ.get("AUTOVIEWER_DEBUG_OVERLAY_DISABLE_TRANSIENT") == "1"
+DEBUG_OVERLAY_DISABLE_OVERRIDE = os.environ.get("AUTOVIEWER_DEBUG_OVERLAY_DISABLE_OVERRIDE") == "1"
+DEBUG_TIMELINE_LOG = os.environ.get("AUTOVIEWER_DEBUG_TIMELINE") == "1"
+DEBUG_HUD = os.environ.get("AUTOVIEWER_DEBUG_HUD") == "1"
+DEBUG_RESIZE_PROBE = os.environ.get("AUTOVIEWER_DEBUG_RESIZE_PROBE") == "1"
+METADATA_REFRESH_DELAY_MS = 0
+THUMBNAIL_HIGHLIGHT_DELAY_MS = 0
+DEBUG_HUD_REFRESH_MS = 100
+RESIZE_PROBE_POLL_MS = 33
+RESIZE_PROBE_EDGE_PX = 14
+
+if sys.platform.startswith("win"):
+    WM_ENTERSIZEMOVE = 0x0231
+    WM_EXITSIZEMOVE = 0x0232
+    WM_SIZE = 0x0005
+    WM_WINDOWPOSCHANGING = 0x0046
+    WM_WINDOWPOSCHANGED = 0x0047
+    WM_SYSCOMMAND = 0x0112
+    WM_NCLBUTTONDOWN = 0x00A1
+    GWLP_WNDPROC = -4
+    SW_HIDE = 0
+    GA_ROOT = 2
+    GA_ROOTOWNER = 3
+    GW_OWNER = 4
+    SC_SIZE = 0xF000
+    VK_LBUTTON = 0x01
 
 class NewImageHandler(FileSystemEventHandler):
     """フォルダに新しいファイルが追加されたことを検知するハンドラ"""
@@ -51,7 +84,9 @@ class ImageViewerApp:
         self.current_source_image = None
         self.current_source_path = None
         self.current_render_image = None
-        self.current_render_image = None
+        self.current_render_path = None
+        self.current_render_size = None
+        self.current_render_resample = None
         self.photo = None
         self.metadata_overlay = None
         self.metadata_overlay_visible = False
@@ -59,6 +94,7 @@ class ImageViewerApp:
         self.metadata_text_value = None
         self.metadata_cache = {}
         self.render_scheduled = False
+        self.render_after_id = None
         self.layout_dirty = False
         self.image_dirty = False
         self.metadata_dirty = False
@@ -67,9 +103,46 @@ class ImageViewerApp:
         self.resize_preview_after_id = None
         self.is_live_resizing = False
         self.panels_hidden_for_resize = False
+        self.resume_play_after_resize = False
         self.thumbnail_scroll_after_id = None
+        self.metadata_refresh_after_id = None
+        self.metadata_refresh_target_path = None
+        self.thumbnail_highlight_after_id = None
+        self.thumbnail_highlight_target_path = None
         self.thumbnail_follow_path = None
         self.last_root_size = None
+        self.native_resize_active = False
+        self.native_resize_hook_installed = False
+        self.native_resize_hwnd = None
+        self.native_resize_hwnds = []
+        self.native_resize_hwnd_labels = {}
+        self.native_resize_orig_procs = {}
+        self.default_wndproc = None
+        self.window_proc = None
+        self.last_native_resize_enter_at = None
+        self.last_native_resize_exit_at = None
+        self.last_native_resize_source = None
+        self.resize_probe_hwnd = None
+        self.resize_probe_candidate_at = None
+        self.resize_probe_candidate_edge = None
+        self.resize_probe_candidate_cursor = None
+        self.resize_probe_candidate_consumed = False
+        self.resize_probe_left_down = False
+        self.resize_probe_thread = None
+        self.resize_probe_stop_event = None
+        self.timeline_event_seq = 0
+        self.debug_hud_label = None
+        self.debug_hud_after_id = None
+        self.debug_hud_dirty = False
+        self.debug_hud_data = {}
+        self.debug_hud_data.update(
+            {
+                "render_status": "idle",
+                "preview_status": "idle",
+                "meta_status": "idle",
+                "thumb_status": "idle",
+            }
+        )
         
         # タップ・スワイプ判定用
         self.start_x = None
@@ -80,6 +153,8 @@ class ImageViewerApp:
 
         # UI要素の構築
         self.setup_ui()
+        self.install_native_resize_hook()
+        self.start_resize_probe()
         self.sync_interval_ui()
         self.update_play_pause_button()
         self.update_fullscreen_button()
@@ -105,19 +180,15 @@ class ImageViewerApp:
         self.content_frame.pack(fill=tk.BOTH, expand=True)
         self.content_frame.grid_rowconfigure(0, weight=1)
         self.content_frame.grid_columnconfigure(0, weight=1)
+        self.content_frame.grid_columnconfigure(1, weight=0)
 
         self.image_area = tk.Frame(self.content_frame, bg='black')
         self.image_area.grid(row=0, column=0, sticky="nsew")
 
-        self.metadata_overlay = tk.Toplevel(self.root)
-        self.metadata_overlay.withdraw()
-        self.metadata_overlay.overrideredirect(True)
-        self.metadata_overlay.transient(self.root)
-        self.metadata_overlay.attributes("-alpha", 0.72)
-        self.metadata_overlay.configure(bg='#141414')
-
-        self.metadata_frame = tk.Frame(self.metadata_overlay, bg='#141414', width=360, bd=1, relief=tk.SOLID)
-        self.metadata_frame.pack(fill=tk.BOTH, expand=True)
+        self.metadata_frame = tk.Frame(self.content_frame, bg='#141414', width=360, bd=1, relief=tk.SOLID)
+        self.metadata_frame.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
+        self.metadata_frame.grid_remove()
+        self.metadata_frame.pack_propagate(False)
         self.metadata_header = tk.Label(
             self.metadata_frame,
             text="Image Info",
@@ -148,13 +219,28 @@ class ImageViewerApp:
         self.image_label = tk.Label(self.image_area, bg='black')
         self.image_label.pack(fill=tk.BOTH, expand=True)
 
+        if DEBUG_HUD:
+            self.debug_hud_label = tk.Label(
+                self.image_area,
+                bg='#101010',
+                fg='#9FE870',
+                justify=tk.LEFT,
+                anchor='nw',
+                padx=8,
+                pady=6,
+                font=("Consolas", 9),
+                bd=1,
+                relief=tk.SOLID,
+            )
+            self.debug_hud_label.place(x=12, y=12)
+
         # マウス（タッチ）イベントのバインド
         self.image_label.bind("<ButtonPress-1>", self.on_press)
         self.image_label.bind("<ButtonRelease-1>", self.on_release)
         self.image_label.bind("<Button-3>", self.show_context_menu)
 
         self.thumbnail_frame = tk.Frame(self.content_frame, bg='#161616', height=164, bd=1, relief=tk.SOLID)
-        self.thumbnail_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.thumbnail_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         self.thumbnail_frame.grid_remove()
         self.thumbnail_frame.grid_propagate(False)
         self.thumbnail_header = tk.Label(
@@ -376,20 +462,183 @@ class ImageViewerApp:
 
     def request_render(self, *, layout=False, image=False, metadata=False, thumbnail_highlight=False):
         """必要な描画更新を1回に集約して予約"""
+        self.log_timeline(
+            f"request_render layout={layout} image={image} metadata={metadata} "
+            f"thumbnail_highlight={thumbnail_highlight}"
+        )
         self.layout_dirty = self.layout_dirty or layout
         self.image_dirty = self.image_dirty or image
         self.metadata_dirty = self.metadata_dirty or metadata
         self.thumbnail_highlight_dirty = self.thumbnail_highlight_dirty or thumbnail_highlight
+        if image:
+            self.set_debug_hud_value("render_status", "pending")
 
         if self.render_scheduled:
             return
 
         self.render_scheduled = True
-        self.root.after_idle(self.render_pending_updates)
+        self.render_after_id = self.root.after_idle(self.render_pending_updates)
+
+    def log_resize_debug(self, message):
+        """リサイズまわりのデバッグログを必要時だけ出す"""
+        if not DEBUG_RESIZE_LOG:
+            return
+        print(f"[resize-debug {time.perf_counter():.6f}] {message}")
+
+    def log_timeline(self, message):
+        """描画と自動送りのタイムラインを必要時だけ出す"""
+        if not DEBUG_TIMELINE_LOG:
+            return
+        self.timeline_event_seq += 1
+        print(f"[timeline {time.perf_counter():.6f} #{self.timeline_event_seq}] {message}")
+
+    def log_native_probe(self, hwnd_value, msg, wparam, lparam):
+        if not DEBUG_RESIZE_LOG:
+            return
+
+        source = self.native_resize_hwnd_labels.get(hwnd_value, str(hwnd_value))
+        if msg == WM_NCLBUTTONDOWN:
+            self.log_resize_debug(
+                f"native probe source={source} msg=WM_NCLBUTTONDOWN wparam={int(wparam)} lparam={int(lparam)}"
+            )
+        elif msg == WM_SYSCOMMAND:
+            command = int(wparam) & 0xFFF0
+            suffix = " SC_SIZE" if command == SC_SIZE else ""
+            self.log_resize_debug(
+                f"native probe source={source} msg=WM_SYSCOMMAND cmd=0x{command:04X} raw=0x{int(wparam):04X}{suffix}"
+            )
+        elif msg == WM_SIZE:
+            self.log_resize_debug(
+                f"native probe source={source} msg=WM_SIZE wparam={int(wparam)} lparam={int(lparam)}"
+            )
+        elif msg == WM_WINDOWPOSCHANGING:
+            if self.resize_probe_candidate_at is not None and not self.resize_probe_candidate_consumed:
+                delta_ms = (time.perf_counter() - self.resize_probe_candidate_at) * 1000
+                self.log_resize_debug(
+                    f"resize probe -> WM_WINDOWPOSCHANGING delta={delta_ms:.1f}ms "
+                    f"edge={self.resize_probe_candidate_edge} cursor={self.resize_probe_candidate_cursor}"
+                )
+                self.resize_probe_candidate_consumed = True
+
+    def start_resize_probe(self):
+        if not DEBUG_RESIZE_PROBE or not sys.platform.startswith("win"):
+            return
+        if self.resize_probe_thread and self.resize_probe_thread.is_alive():
+            return
+        self.resize_probe_hwnd = self.native_resize_hwnd or self.root.winfo_id()
+        self.resize_probe_stop_event = threading.Event()
+        self.resize_probe_thread = threading.Thread(
+            target=self.run_resize_probe_loop,
+            name="autoviewer-resize-probe",
+            daemon=True,
+        )
+        self.resize_probe_thread.start()
+
+    def run_resize_probe_loop(self):
+        if not DEBUG_RESIZE_PROBE or not sys.platform.startswith("win"):
+            return
+
+        user32 = ctypes.windll.user32
+        while self.resize_probe_stop_event and not self.resize_probe_stop_event.wait(RESIZE_PROBE_POLL_MS / 1000.0):
+            if not self.is_slideshow_active:
+                continue
+
+            try:
+                if self.resize_probe_hwnd is None:
+                    continue
+
+                point = wintypes.POINT()
+                rect = wintypes.RECT()
+                if not user32.GetCursorPos(ctypes.byref(point)):
+                    continue
+                if not user32.GetWindowRect(self.resize_probe_hwnd, ctypes.byref(rect)):
+                    continue
+
+                left_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+                x = int(point.x)
+                y = int(point.y)
+                left = int(rect.left)
+                top = int(rect.top)
+                right = int(rect.right)
+                bottom = int(rect.bottom)
+
+                edge = None
+                near_left = abs(x - left) <= RESIZE_PROBE_EDGE_PX and top <= y <= bottom
+                near_right = abs(x - right) <= RESIZE_PROBE_EDGE_PX and top <= y <= bottom
+                near_top = abs(y - top) <= RESIZE_PROBE_EDGE_PX and left <= x <= right
+                near_bottom = abs(y - bottom) <= RESIZE_PROBE_EDGE_PX and left <= x <= right
+
+                if near_left:
+                    edge = "left"
+                elif near_right:
+                    edge = "right"
+                elif near_top:
+                    edge = "top"
+                elif near_bottom:
+                    edge = "bottom"
+
+                if left_down and not self.resize_probe_left_down and edge and not self.is_live_resizing:
+                    self.resize_probe_candidate_at = time.perf_counter()
+                    self.resize_probe_candidate_edge = edge
+                    self.resize_probe_candidate_cursor = (x, y)
+                    self.resize_probe_candidate_consumed = False
+                    self.log_resize_debug(
+                        f"resize probe candidate edge={edge} cursor=({x}, {y}) rect=({left}, {top}, {right}, {bottom})"
+                    )
+                elif not left_down and self.resize_probe_left_down:
+                    self.resize_probe_candidate_consumed = False
+
+                self.resize_probe_left_down = left_down
+            except Exception as exc:
+                self.log_resize_debug(f"resize probe error: {exc}")
+
+    def set_debug_hud_value(self, key, value):
+        """デバッグ HUD 用の最新値を保持する"""
+        if not DEBUG_HUD:
+            return
+        self.debug_hud_data[key] = value
+        self.request_debug_hud_refresh()
+
+    def request_debug_hud_refresh(self):
+        """HUD の画面更新を低頻度で予約する"""
+        if not DEBUG_HUD or self.debug_hud_label is None:
+            return
+        self.debug_hud_dirty = True
+        if self.debug_hud_after_id:
+            return
+        self.debug_hud_after_id = self.root.after(DEBUG_HUD_REFRESH_MS, self.flush_debug_hud)
+
+    def flush_debug_hud(self):
+        """低頻度で HUD 表示を更新する"""
+        self.debug_hud_after_id = None
+        if not DEBUG_HUD or self.debug_hud_label is None or not self.debug_hud_dirty:
+            return
+
+        self.debug_hud_dirty = False
+        current_path = self.get_current_image_path()
+        current_name = os.path.basename(current_path) if current_path else "-"
+        lines = [
+            f"idx: {self.current_index}",
+            f"img: {current_name}",
+            f"play: {self.is_playing}  resize: {self.is_live_resizing}",
+            f"thumb: {self.thumbnail_visible}  meta: {self.metadata_visible}",
+            f"render: {self.debug_hud_data.get('render_status', '-')} {self.debug_hud_data.get('render_ms', '-')}",
+            f"preview: {self.debug_hud_data.get('preview_status', '-')} {self.debug_hud_data.get('preview_ms', '-')}",
+            f"meta: {self.debug_hud_data.get('meta_status', '-')} {self.debug_hud_data.get('meta_ms', '-')}",
+            f"thumb: {self.debug_hud_data.get('thumb_status', '-')} {self.debug_hud_data.get('thumb_ms', '-')}",
+            f"event: {self.debug_hud_data.get('event', '-')}",
+        ]
+        self.debug_hud_label.config(text="\n".join(lines))
 
     def render_pending_updates(self):
         """予約済みのUI更新をまとめて反映"""
+        start = time.perf_counter()
+        self.log_timeline(
+            f"render_pending_updates start layout_dirty={self.layout_dirty} image_dirty={self.image_dirty} "
+            f"metadata_dirty={self.metadata_dirty} thumbnail_dirty={self.thumbnail_highlight_dirty}"
+        )
         self.render_scheduled = False
+        self.render_after_id = None
 
         if self.layout_dirty:
             image_followup = self.image_dirty
@@ -407,6 +656,7 @@ class ImageViewerApp:
                     metadata=metadata_followup,
                     thumbnail_highlight=thumbnail_followup
                 )
+            self.log_timeline(f"render_pending_updates end duration={(time.perf_counter() - start) * 1000:.1f}ms")
             return
 
         if self.image_dirty:
@@ -414,11 +664,12 @@ class ImageViewerApp:
             self.image_dirty = False
         else:
             if self.metadata_dirty:
-                self.refresh_metadata_display()
+                self.schedule_metadata_refresh()
                 self.metadata_dirty = False
             if self.thumbnail_highlight_dirty:
-                self.highlight_current_thumbnail()
+                self.schedule_thumbnail_highlight()
                 self.thumbnail_highlight_dirty = False
+        self.log_timeline(f"render_pending_updates end duration={(time.perf_counter() - start) * 1000:.1f}ms")
 
     def get_current_image_path(self):
         """現在選択中の画像パスを返す"""
@@ -435,12 +686,84 @@ class ImageViewerApp:
                 pass
         self.current_source_image = None
         self.current_source_path = None
+        self.current_render_image = None
+        self.current_render_path = None
+        self.current_render_size = None
+        self.current_render_resample = None
+
+    def begin_resize_session(self):
+        """リサイズ中の軽量表示モードへ切り替え"""
+        if self.is_live_resizing:
+            self.log_resize_debug("begin_resize_session skipped: already live resizing")
+            return
+
+        start = time.perf_counter()
+        self.log_resize_debug(
+            f"begin_resize_session start metadata_visible={self.metadata_visible} "
+            f"overlay_visible={self.metadata_overlay_visible} thumbnail_visible={self.thumbnail_visible} "
+            f"alpha_disabled={DEBUG_OVERLAY_DISABLE_ALPHA} "
+            f"transient_disabled={DEBUG_OVERLAY_DISABLE_TRANSIENT} "
+            f"override_disabled={DEBUG_OVERLAY_DISABLE_OVERRIDE}"
+        )
+
+        if self.render_after_id:
+            self.root.after_cancel(self.render_after_id)
+            self.render_after_id = None
+            self.log_resize_debug("canceled pending render_after_id")
+            self.set_debug_hud_value("render_status", "idle")
+        self.render_scheduled = False
+
+        if self.resize_preview_after_id:
+            self.root.after_cancel(self.resize_preview_after_id)
+            self.resize_preview_after_id = None
+            self.log_resize_debug("canceled pending resize_preview_after_id")
+            self.set_debug_hud_value("preview_status", "idle")
+
+        self.cancel_metadata_refresh()
+        self.cancel_thumbnail_highlight()
+        self.resume_play_after_resize = self.is_playing
+        if self.resume_play_after_resize:
+            self.cancel_scheduled_image()
+            self.log_resize_debug("paused scheduled slideshow advance during resize")
+
+        self.is_live_resizing = True
+        self.set_debug_hud_value("event", "resize-start")
+        self.log_resize_debug(f"begin_resize_session end duration={(time.perf_counter() - start) * 1000:.1f}ms")
+
+    def end_resize_session(self):
+        """リサイズ完了後に通常表示へ戻す"""
+        start = time.perf_counter()
+        self.log_resize_debug("end_resize_session start")
+        self.is_live_resizing = False
+        self.request_render(
+            layout=True,
+            image=True,
+            metadata=self.metadata_visible,
+            thumbnail_highlight=self.thumbnail_visible,
+        )
+        if self.resume_play_after_resize and self.is_playing and self.is_slideshow_active:
+            self.schedule_next_image()
+        self.resume_play_after_resize = False
+        self.set_debug_hud_value("event", "resize-end")
+        self.log_resize_debug(f"end_resize_session end duration={(time.perf_counter() - start) * 1000:.1f}ms")
+
+    def hide_metadata_overlay_now(self):
+        """情報欄を可能な限り即時に隠す"""
+        if not self.metadata_overlay_visible:
+            self.log_resize_debug("hide_metadata_overlay_now skipped")
+            return
+
+        start = time.perf_counter()
+        self.log_resize_debug("hide_metadata_overlay_now start")
+        self.metadata_frame.grid_remove()
+        self.metadata_overlay_visible = False
+        self.log_resize_debug(f"hide_metadata_overlay_now end duration={(time.perf_counter() - start) * 1000:.1f}ms")
 
     def apply_panel_layout(self):
         """サムネイル帯と情報欄の表示状態をレイアウトへ反映"""
         if not self.is_slideshow_active:
-            if self.metadata_overlay is not None and self.metadata_overlay_visible:
-                self.metadata_overlay.withdraw()
+            if self.metadata_overlay_visible:
+                self.metadata_frame.grid_remove()
                 self.metadata_overlay_visible = False
             self.thumbnail_frame.grid_remove()
             self.update_thumbnail_buttons()
@@ -451,13 +774,11 @@ class ImageViewerApp:
         show_thumbnail_strip = self.thumbnail_visible and not self.panels_hidden_for_resize
 
         if show_metadata_overlay:
-            self.update_metadata_overlay_geometry()
             if not self.metadata_overlay_visible:
-                self.metadata_overlay.deiconify()
-                self.metadata_overlay.lift(self.root)
+                self.metadata_frame.grid()
                 self.metadata_overlay_visible = True
         elif self.metadata_overlay_visible:
-            self.metadata_overlay.withdraw()
+            self.metadata_frame.grid_remove()
             self.metadata_overlay_visible = False
 
         if show_thumbnail_strip:
@@ -467,6 +788,221 @@ class ImageViewerApp:
 
         self.update_thumbnail_buttons()
         self.update_metadata_button()
+
+    def install_native_resize_hook(self):
+        """Windows ではネイティブメッセージでサイズ変更開始/終了を拾う"""
+        if not sys.platform.startswith("win") or self.native_resize_hook_installed:
+            return
+
+        try:
+            self.root.update_idletasks()
+            user32 = ctypes.windll.user32
+            get_parent = user32.GetParent
+            get_ancestor = user32.GetAncestor
+            get_window = user32.GetWindow
+            set_window_long_ptr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            call_window_proc = user32.CallWindowProcW
+
+            wndproc_type = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+
+            get_parent.restype = wintypes.HWND
+            get_parent.argtypes = [wintypes.HWND]
+            get_ancestor.restype = wintypes.HWND
+            get_ancestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            get_window.restype = wintypes.HWND
+            get_window.argtypes = [wintypes.HWND, wintypes.UINT]
+            set_window_long_ptr.restype = ctypes.c_void_p
+            set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            call_window_proc.restype = ctypes.c_ssize_t
+            call_window_proc.argtypes = [
+                ctypes.c_void_p,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+
+            def window_proc(hwnd_value, msg, wparam, lparam):
+                if msg in {
+                    WM_NCLBUTTONDOWN,
+                    WM_SYSCOMMAND,
+                    WM_SIZE,
+                    WM_WINDOWPOSCHANGING,
+                    WM_WINDOWPOSCHANGED,
+                }:
+                    self.log_native_probe(hwnd_value, msg, wparam, lparam)
+                if msg == WM_ENTERSIZEMOVE:
+                    self.last_native_resize_enter_at = time.perf_counter()
+                    self.last_native_resize_source = self.native_resize_hwnd_labels.get(hwnd_value, str(hwnd_value))
+                    self.root.after(0, self.on_native_resize_enter)
+                elif msg == WM_EXITSIZEMOVE:
+                    self.last_native_resize_exit_at = time.perf_counter()
+                    self.last_native_resize_source = self.native_resize_hwnd_labels.get(hwnd_value, str(hwnd_value))
+                    self.root.after(0, self.on_native_resize_exit)
+
+                default_proc = self.native_resize_orig_procs.get(hwnd_value)
+                if default_proc:
+                    return call_window_proc(default_proc, hwnd_value, msg, wparam, lparam)
+                return 0
+
+            self.window_proc = wndproc_type(window_proc)
+            base_hwnd = self.root.winfo_id()
+            candidates = []
+            seen = set()
+
+            def add_candidate(label, hwnd_value):
+                if not hwnd_value or hwnd_value in seen:
+                    return
+                seen.add(hwnd_value)
+                candidates.append((label, hwnd_value))
+
+            parent_hwnd = get_parent(base_hwnd)
+            root_hwnd = get_ancestor(base_hwnd, GA_ROOT)
+            rootowner_hwnd = get_ancestor(base_hwnd, GA_ROOTOWNER)
+            owner_base_hwnd = get_window(base_hwnd, GW_OWNER)
+            parent_parent_hwnd = get_parent(parent_hwnd) if parent_hwnd else 0
+            parent_root_hwnd = get_ancestor(parent_hwnd, GA_ROOT) if parent_hwnd else 0
+            parent_rootowner_hwnd = get_ancestor(parent_hwnd, GA_ROOTOWNER) if parent_hwnd else 0
+            owner_parent_hwnd = get_window(parent_hwnd, GW_OWNER) if parent_hwnd else 0
+            owner_root_hwnd = get_window(root_hwnd, GW_OWNER) if root_hwnd else 0
+
+            add_candidate("parent", parent_hwnd)
+            add_candidate("root", root_hwnd)
+            add_candidate("rootowner", rootowner_hwnd)
+            add_candidate("owner_base", owner_base_hwnd)
+            add_candidate("parent_parent", parent_parent_hwnd)
+            add_candidate("parent_root", parent_root_hwnd)
+            add_candidate("parent_rootowner", parent_rootowner_hwnd)
+            add_candidate("owner_parent", owner_parent_hwnd)
+            add_candidate("owner_root", owner_root_hwnd)
+            add_candidate("base", base_hwnd)
+
+            self.log_resize_debug(
+                "native resize hwnd graph="
+                + ", ".join(
+                    [
+                        f"base:{base_hwnd}",
+                        f"parent:{parent_hwnd}",
+                        f"root:{root_hwnd}",
+                        f"rootowner:{rootowner_hwnd}",
+                        f"owner_base:{owner_base_hwnd}",
+                        f"parent_parent:{parent_parent_hwnd}",
+                        f"parent_root:{parent_root_hwnd}",
+                        f"parent_rootowner:{parent_rootowner_hwnd}",
+                        f"owner_parent:{owner_parent_hwnd}",
+                        f"owner_root:{owner_root_hwnd}",
+                    ]
+                )
+            )
+
+            for label, hwnd in candidates:
+                original_proc = set_window_long_ptr(hwnd, GWLP_WNDPROC, self.window_proc)
+                if original_proc:
+                    self.native_resize_orig_procs[hwnd] = original_proc
+                    self.native_resize_hwnd_labels[hwnd] = label
+                    self.native_resize_hwnds.append(hwnd)
+
+            if self.native_resize_hwnds:
+                self.native_resize_hwnd = self.native_resize_hwnds[0]
+                self.default_wndproc = self.native_resize_orig_procs[self.native_resize_hwnd]
+                self.native_resize_hook_installed = True
+                self.log_resize_debug(
+                    "native resize hook candidates="
+                    + ", ".join(
+                        f"{self.native_resize_hwnd_labels[hwnd]}:{hwnd}"
+                        for hwnd in self.native_resize_hwnds
+                    )
+                )
+            else:
+                self.native_resize_hook_installed = False
+        except Exception as exc:
+            print(f"Native resize hook unavailable: {exc}")
+            self.window_proc = None
+            self.default_wndproc = None
+            self.native_resize_hwnd = None
+            self.native_resize_hwnds = []
+            self.native_resize_hwnd_labels = {}
+            self.native_resize_orig_procs = {}
+            self.native_resize_hook_installed = False
+
+    def uninstall_native_resize_hook(self):
+        """Windows のサブクラス化を元に戻す"""
+        if (
+            not sys.platform.startswith("win")
+            or not self.native_resize_hook_installed
+            or not self.native_resize_hwnds
+        ):
+            return
+
+        try:
+            user32 = ctypes.windll.user32
+            set_window_long_ptr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            set_window_long_ptr.restype = ctypes.c_void_p
+            set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            for hwnd in self.native_resize_hwnds:
+                original_proc = self.native_resize_orig_procs.get(hwnd)
+                if original_proc:
+                    set_window_long_ptr(hwnd, GWLP_WNDPROC, original_proc)
+        except Exception as exc:
+            print(f"Failed to restore window procedure: {exc}")
+        finally:
+            self.native_resize_hook_installed = False
+            self.native_resize_hwnd = None
+            self.native_resize_hwnds = []
+            self.native_resize_hwnd_labels = {}
+            self.native_resize_orig_procs = {}
+            self.default_wndproc = None
+            self.window_proc = None
+
+    def on_native_resize_enter(self):
+        """Windows のサイズ変更モード開始を処理"""
+        if not self.is_slideshow_active:
+            return
+
+        if self.last_native_resize_enter_at is not None:
+            delay_ms = (time.perf_counter() - self.last_native_resize_enter_at) * 1000
+            self.log_resize_debug(
+                f"on_native_resize_enter source={self.last_native_resize_source} callback delay={delay_ms:.1f}ms"
+            )
+        else:
+            self.log_resize_debug("on_native_resize_enter callback delay=unknown")
+
+        self.native_resize_active = True
+        self.begin_resize_session()
+
+    def on_native_resize_exit(self):
+        """Windows のサイズ変更モード終了を処理"""
+        if not self.native_resize_active:
+            return
+
+        if self.last_native_resize_exit_at is not None:
+            delay_ms = (time.perf_counter() - self.last_native_resize_exit_at) * 1000
+            self.log_resize_debug(
+                f"on_native_resize_exit source={self.last_native_resize_source} callback delay={delay_ms:.1f}ms"
+            )
+        else:
+            self.log_resize_debug("on_native_resize_exit callback delay=unknown")
+
+        self.native_resize_active = False
+
+        if self.resize_after_id:
+            self.root.after_cancel(self.resize_after_id)
+            self.resize_after_id = None
+        if self.resize_preview_after_id:
+            self.root.after_cancel(self.resize_preview_after_id)
+            self.resize_preview_after_id = None
+
+        if self.is_slideshow_active:
+            self.end_resize_session()
+        else:
+            self.is_live_resizing = False
+            self.panels_hidden_for_resize = False
 
     def set_metadata_text(self, text):
         """情報欄のテキストを更新"""
@@ -478,6 +1014,103 @@ class ImageViewerApp:
         self.metadata_text.delete("1.0", tk.END)
         self.metadata_text.insert("1.0", text)
         self.metadata_text.configure(state=tk.DISABLED)
+
+    def cancel_metadata_refresh(self):
+        """遅延中の情報欄更新を取り消す"""
+        if self.metadata_refresh_after_id:
+            self.root.after_cancel(self.metadata_refresh_after_id)
+            self.metadata_refresh_after_id = None
+        self.set_debug_hud_value("meta_status", "idle")
+        self.metadata_refresh_target_path = None
+
+    def schedule_metadata_refresh(self, image_path=None):
+        """情報欄更新を短く遅延させて予約"""
+        self.cancel_metadata_refresh()
+
+        target_path = image_path or self.get_current_image_path()
+        if not target_path or not self.metadata_visible:
+            return
+
+        self.metadata_refresh_target_path = target_path
+        self.set_debug_hud_value("meta_status", "pending")
+        if METADATA_REFRESH_DELAY_MS <= 0:
+            self.metadata_refresh_after_id = None
+            self.flush_metadata_refresh()
+            return
+        self.metadata_refresh_after_id = self.root.after(
+            METADATA_REFRESH_DELAY_MS,
+            self.flush_metadata_refresh,
+        )
+
+    def flush_metadata_refresh(self):
+        """遅延予約した情報欄更新を実行"""
+        start = time.perf_counter()
+        self.metadata_refresh_after_id = None
+        target_path = self.metadata_refresh_target_path
+        self.metadata_refresh_target_path = None
+
+        if not self.metadata_visible or not target_path or target_path != self.get_current_image_path():
+            self.set_debug_hud_value("meta_status", "idle")
+            return
+
+        self.set_debug_hud_value("meta_status", "running")
+        self.log_timeline(f"flush_metadata_refresh start path={os.path.basename(target_path)}")
+        image = self.current_source_image if self.current_source_path == target_path else None
+        self.refresh_metadata_display(image_path=target_path, image=image)
+        self.metadata_dirty = False
+        duration_ms = (time.perf_counter() - start) * 1000
+        self.set_debug_hud_value("meta_ms", f"{duration_ms:.1f}ms")
+        self.set_debug_hud_value("meta_status", "done")
+        self.set_debug_hud_value("event", "metadata")
+        self.log_timeline(f"flush_metadata_refresh end duration={duration_ms:.1f}ms")
+
+    def cancel_thumbnail_highlight(self):
+        """遅延中のサムネイル強調更新を取り消す"""
+        if self.thumbnail_highlight_after_id:
+            self.root.after_cancel(self.thumbnail_highlight_after_id)
+            self.thumbnail_highlight_after_id = None
+        self.set_debug_hud_value("thumb_status", "idle")
+        self.thumbnail_highlight_target_path = None
+
+    def schedule_thumbnail_highlight(self, image_path=None):
+        """サムネイル強調更新を短く遅延させて予約"""
+        self.cancel_thumbnail_highlight()
+
+        target_path = image_path or self.get_current_image_path()
+        if not target_path or not self.thumbnail_visible:
+            return
+
+        self.thumbnail_highlight_target_path = target_path
+        self.set_debug_hud_value("thumb_status", "pending")
+        if THUMBNAIL_HIGHLIGHT_DELAY_MS <= 0:
+            self.thumbnail_highlight_after_id = None
+            self.flush_thumbnail_highlight()
+            return
+        self.thumbnail_highlight_after_id = self.root.after(
+            THUMBNAIL_HIGHLIGHT_DELAY_MS,
+            self.flush_thumbnail_highlight,
+        )
+
+    def flush_thumbnail_highlight(self):
+        """遅延予約したサムネイル強調更新を実行"""
+        start = time.perf_counter()
+        self.thumbnail_highlight_after_id = None
+        target_path = self.thumbnail_highlight_target_path
+        self.thumbnail_highlight_target_path = None
+
+        if not self.thumbnail_visible or not target_path or target_path != self.get_current_image_path():
+            self.set_debug_hud_value("thumb_status", "idle")
+            return
+
+        self.set_debug_hud_value("thumb_status", "running")
+        self.log_timeline(f"flush_thumbnail_highlight start path={os.path.basename(target_path)}")
+        self.highlight_current_thumbnail()
+        self.thumbnail_highlight_dirty = False
+        duration_ms = (time.perf_counter() - start) * 1000
+        self.set_debug_hud_value("thumb_ms", f"{duration_ms:.1f}ms")
+        self.set_debug_hud_value("thumb_status", "done")
+        self.set_debug_hud_value("event", "thumbnail")
+        self.log_timeline(f"flush_thumbnail_highlight end duration={duration_ms:.1f}ms")
 
     def show_context_menu(self, event):
         """逕ｻ蜒上・蜿ｳ繧ｯ繝ｪ繝・け繝｡繝九Η繝ｼ繧呈款縺・"""
@@ -581,6 +1214,9 @@ finally {{
             return
 
         self.thumbnail_visible = not self.thumbnail_visible
+        if not self.thumbnail_visible:
+            self.cancel_thumbnail_highlight()
+            self.cancel_thumbnail_follow()
         self.request_render(layout=True, image=True, thumbnail_highlight=True)
 
     def toggle_metadata_panel(self):
@@ -589,6 +1225,8 @@ finally {{
             return
 
         self.metadata_visible = not self.metadata_visible
+        if not self.metadata_visible:
+            self.cancel_metadata_refresh()
         self.request_render(layout=True, metadata=True)
 
     def clear_image_queue(self):
@@ -688,13 +1326,23 @@ finally {{
         if not size_changed:
             return
 
+        if self.native_resize_active:
+            self.log_resize_debug(f"configure during native resize size={current_size}")
+
         resize_just_started = not self.is_live_resizing
-        self.is_live_resizing = True
         if resize_just_started:
-            self.panels_hidden_for_resize = True
-            self.apply_panel_layout()
+            if self.resize_probe_candidate_at is not None and not self.resize_probe_candidate_consumed:
+                delta_ms = (time.perf_counter() - self.resize_probe_candidate_at) * 1000
+                self.log_resize_debug(
+                    f"resize probe -> configure delta={delta_ms:.1f}ms "
+                    f"edge={self.resize_probe_candidate_edge} cursor={self.resize_probe_candidate_cursor}"
+                )
+                self.resize_probe_candidate_consumed = True
+            self.log_resize_debug(f"configure begin fallback size={current_size}")
+            self.begin_resize_session()
 
         if self.current_source_image is not None and self.resize_preview_after_id is None:
+            self.set_debug_hud_value("preview_status", "pending")
             self.resize_preview_after_id = self.root.after_idle(self.flush_resize_preview)
 
         if self.resize_after_id:
@@ -705,14 +1353,17 @@ finally {{
         """リサイズ中の軽量プレビュー描画"""
         self.resize_preview_after_id = None
         if not self.is_slideshow_active or not self.is_live_resizing or self.current_source_image is None:
+            self.set_debug_hud_value("preview_status", "idle")
             return
 
+        self.set_debug_hud_value("preview_status", "running")
         self.render_current_image(
             resample=Image.Resampling.BILINEAR,
             refresh_metadata=False,
             refresh_thumbnail=False,
             use_preview_source=True,
         )
+        self.set_debug_hud_value("preview_status", "done")
 
     def flush_resize_updates(self):
         """連続するConfigureイベント後に再描画をまとめて実行"""
@@ -720,36 +1371,14 @@ finally {{
         if not self.is_slideshow_active:
             return
 
-        self.is_live_resizing = False
-        self.panels_hidden_for_resize = False
-        self.request_render(
-            layout=True,
-            image=True,
-            metadata=self.metadata_visible,
-            thumbnail_highlight=self.thumbnail_visible,
-        )
-
-    def update_metadata_overlay_geometry(self):
-        """右端オーバーレイ情報欄の位置とサイズを更新"""
-        area_x = self.image_area.winfo_rootx()
-        area_y = self.image_area.winfo_rooty()
-        width = self.image_area.winfo_width()
-        height = self.image_area.winfo_height()
-
-        if width <= 1 or height <= 1:
+        if self.native_resize_active:
             return
 
-        margin = 12
-        available_width = max(180, width - (margin * 2))
-        available_height = max(140, height - (margin * 2))
-        overlay_width = min(420, max(220, int(width * 0.28)), available_width)
-        overlay_height = min(max(180, int(height * 0.76)), available_height)
-        overlay_x = area_x + max(margin, width - overlay_width - margin)
-        overlay_y = area_y + margin
-        geometry = f"{overlay_width}x{overlay_height}+{overlay_x}+{overlay_y}"
-        if geometry != self.metadata_overlay_geometry:
-            self.metadata_overlay.geometry(geometry)
-            self.metadata_overlay_geometry = geometry
+        self.end_resize_session()
+
+    def update_metadata_overlay_geometry(self):
+        """情報欄は同一ウィンドウ内の右カラムで管理する"""
+        return
 
     def highlight_current_thumbnail(self):
         """現在表示中のサムネイルを強調表示"""
@@ -757,15 +1386,15 @@ finally {{
         if 0 <= self.current_index < len(self.image_list):
             current_path = self.image_list[self.current_index]
 
+        if not self.thumbnail_visible or not current_path:
+            self.cancel_thumbnail_follow()
+            return
+
         for image_path, button in self.thumbnail_buttons.items():
             if image_path == current_path:
                 button.config(relief=tk.SOLID, bg='#4CAF50', highlightbackground='#4CAF50')
             else:
                 button.config(relief=tk.FLAT, bg='#222222', highlightbackground='#222222')
-
-        if not self.thumbnail_visible or not current_path:
-            self.cancel_thumbnail_follow()
-            return
 
         self.schedule_thumbnail_follow(current_path)
 
@@ -878,6 +1507,32 @@ finally {{
 
         self.set_metadata_text(self.get_metadata_text_for_path(current_path, image=image))
 
+    def get_image_viewport_size(self):
+        """現在の画像表示領域サイズを返す"""
+        viewport_width = self.image_area.winfo_width()
+        viewport_height = self.image_area.winfo_height()
+
+        if viewport_width <= 1 or viewport_height <= 1:
+            viewport_width = self.root.winfo_screenwidth()
+            viewport_height = self.root.winfo_screenheight()
+
+        return viewport_width, viewport_height
+
+    def request_image_render_if_needed(self):
+        """現在の画像と表示領域が変わったときだけ再描画を予約"""
+        image_path = self.get_current_image_path()
+        if not image_path or self.current_source_image is None or self.current_source_path != image_path:
+            self.request_render(image=True, metadata=self.metadata_visible, thumbnail_highlight=self.thumbnail_visible)
+            return
+
+        screen_width, screen_height = self.get_image_viewport_size()
+        img_width, img_height = self.current_source_image.size
+        ratio = min(screen_width / img_width, screen_height / img_height)
+        target_size = (int(img_width * ratio), int(img_height * ratio))
+
+        if self.current_render_path != image_path or self.current_render_size != target_size:
+            self.request_render(image=True, metadata=self.metadata_visible, thumbnail_highlight=self.thumbnail_visible)
+
     def render_current_image(
         self,
         *,
@@ -887,12 +1542,23 @@ finally {{
         use_preview_source=False,
     ):
         """現在選択中の画像を再描画"""
+        start = time.perf_counter()
         image_path = self.get_current_image_path()
         if not image_path:
             self.image_label.config(image='')
             self.photo = None
             self.clear_current_image_cache()
             return
+
+        self.log_timeline(
+            f"render_current_image start path={os.path.basename(image_path)} "
+            f"resample={resample} refresh_metadata={refresh_metadata} "
+            f"refresh_thumbnail={refresh_thumbnail} preview={use_preview_source}"
+        )
+        if use_preview_source:
+            self.set_debug_hud_value("preview_status", "running")
+        else:
+            self.set_debug_hud_value("render_status", "running")
 
         try:
             if self.current_source_path != image_path or self.current_source_image is None:
@@ -915,35 +1581,58 @@ finally {{
             else:
                 img = self.current_source_image
 
-            screen_width = self.image_area.winfo_width()
-            screen_height = self.image_area.winfo_height()
-
-            if screen_width <= 1 or screen_height <= 1:
-                screen_width = self.root.winfo_screenwidth()
-                screen_height = self.root.winfo_screenheight()
+            screen_width, screen_height = self.get_image_viewport_size()
 
             img_width, img_height = img.size
             ratio = min(screen_width / img_width, screen_height / img_height)
             new_width = int(img_width * ratio)
             new_height = int(img_height * ratio)
 
-            rendered_image = img.resize((new_width, new_height), resample)
-            self.current_render_image = rendered_image.copy()
+            render_size = (new_width, new_height)
+            can_reuse_render = (
+                self.current_render_path == image_path
+                and self.current_render_size == render_size
+                and self.current_render_resample == resample
+                and self.photo is not None
+            )
 
-            self.photo = ImageTk.PhotoImage(rendered_image)
-            self.image_label.config(image=self.photo)
+            if can_reuse_render:
+                self.log_resize_debug(f"render_current_image reused existing render size={render_size}")
+            else:
+                rendered_image = img.resize(render_size, resample)
+                self.current_render_image = rendered_image.copy()
+                self.current_render_path = image_path
+                self.current_render_size = render_size
+                self.current_render_resample = resample
+
+                self.photo = ImageTk.PhotoImage(rendered_image)
+                self.image_label.config(image=self.photo)
 
             if self.seekbar_var.get() != self.current_index + 1:
                 self.seekbar_var.set(self.current_index + 1)
 
             if refresh_metadata:
-                self.refresh_metadata_display(image_path=image_path, image=img)
+                self.schedule_metadata_refresh(image_path=image_path)
                 self.metadata_dirty = False
             if refresh_thumbnail:
-                self.highlight_current_thumbnail()
+                self.schedule_thumbnail_highlight(image_path=image_path)
                 self.thumbnail_highlight_dirty = False
 
+            duration_ms = (time.perf_counter() - start) * 1000
+            if use_preview_source:
+                self.set_debug_hud_value("preview_ms", f"{duration_ms:.1f}ms")
+                self.set_debug_hud_value("preview_status", "done")
+            else:
+                self.set_debug_hud_value("render_ms", f"{duration_ms:.1f}ms")
+                self.set_debug_hud_value("render_status", "done")
+            self.set_debug_hud_value("event", "preview" if use_preview_source else "render")
+            self.log_timeline(f"render_current_image end duration={duration_ms:.1f}ms")
+
         except Exception as e:
+            if use_preview_source:
+                self.set_debug_hud_value("preview_status", "idle")
+            else:
+                self.set_debug_hud_value("render_status", "idle")
             print(f"Error loading {image_path}: {e}")
 
     def stop_observer(self):
@@ -958,6 +1647,7 @@ finally {{
         if self.after_id:
             self.root.after_cancel(self.after_id)
             self.after_id = None
+        self.set_debug_hud_value("event", "schedule-cancel")
 
     def schedule_next_image(self, delay_ms=None):
         """次の自動送りを予約"""
@@ -965,6 +1655,8 @@ finally {{
 
         if self.is_playing and self.is_slideshow_active:
             next_delay = self.interval_ms if delay_ms is None else delay_ms
+            self.log_timeline(f"schedule_next_image delay_ms={next_delay}")
+            self.set_debug_hud_value("event", f"schedule-{next_delay}ms")
             self.after_id = self.root.after(next_delay, self.next_image)
 
     def get_image_sort_key(self, image_path):
@@ -1035,7 +1727,7 @@ finally {{
         if self.image_list:
             self.current_index = 0
             self.request_render(image=True, metadata=self.metadata_visible, thumbnail_highlight=True)
-            self.root.after(80, lambda: self.request_render(image=True))
+            self.root.after(80, self.request_image_render_if_needed)
             self.schedule_next_image()
         else:
             self.image_label.config(image='')
@@ -1101,7 +1793,14 @@ finally {{
             self.root.after_cancel(self.resize_preview_after_id)
             self.resize_preview_after_id = None
         self.is_live_resizing = False
+        self.native_resize_active = False
         self.panels_hidden_for_resize = False
+        self.resume_play_after_resize = False
+        self.cancel_metadata_refresh()
+        self.cancel_thumbnail_highlight()
+        self.cancel_thumbnail_follow()
+        self.set_debug_hud_value("render_status", "idle")
+        self.set_debug_hud_value("preview_status", "idle")
         
         # 自動再生のタイマーをキャンセル
         self.cancel_scheduled_image()
@@ -1119,6 +1818,7 @@ finally {{
             self.current_index = -1
             return
 
+        self.log_timeline(f"show_image index={index}")
         self.current_index = index
         current_path = self.get_current_image_path()
         if current_path != self.current_source_path:
@@ -1203,6 +1903,7 @@ finally {{
 
     def next_image(self):
         """次の画像を表示"""
+        self.log_timeline("next_image start")
         self.cancel_scheduled_image()
 
         if self.image_list:
@@ -1214,15 +1915,18 @@ finally {{
                 pass
         
         self.schedule_next_image()
+        self.log_timeline("next_image end")
 
     def prev_image(self):
         """前の画像を表示"""
+        self.log_timeline("prev_image start")
         self.cancel_scheduled_image()
 
         if self.image_list and self.current_index > 0:
             self.show_image(self.current_index - 1)
             
         self.schedule_next_image()
+        self.log_timeline("prev_image end")
 
     def toggle_play(self, event=None):
         """再生/一時停止の切り替え"""
@@ -1272,8 +1976,18 @@ finally {{
         """アプリ終了時の処理"""
         self.stop_observer()
         self.clear_current_image_cache()
-        if self.metadata_overlay is not None:
-            self.metadata_overlay.destroy()
+        self.uninstall_native_resize_hook()
+        if self.resize_probe_stop_event:
+            self.resize_probe_stop_event.set()
+        if self.resize_probe_thread and self.resize_probe_thread.is_alive():
+            self.resize_probe_thread.join(timeout=0.2)
+        self.resize_probe_thread = None
+        self.resize_probe_stop_event = None
+        self.cancel_metadata_refresh()
+        self.cancel_thumbnail_highlight()
+        self.cancel_thumbnail_follow()
+        self.set_debug_hud_value("render_status", "idle")
+        self.set_debug_hud_value("preview_status", "idle")
         self.root.destroy()
 
 if __name__ == "__main__":
