@@ -14,3 +14,9 @@ ENV/
 
 .DS_Store
 Thumbs.db
+
+# Local assistant / debug artifacts
+.claude/
+CLAUDE.md
+debug-timeline.log
+resize-debug.log
