@@ -108,9 +108,7 @@ class ImageViewerApp:
         self.current_render_size = None
         self.current_render_resample = None
         self.photo = None
-        self.metadata_overlay = None
-        self.metadata_overlay_visible = False
-        self.metadata_overlay_geometry = ""
+        self.metadata_panel_visible = False
         self.metadata_text_value = None
         self.metadata_cache = OrderedDict()
         self.render_scheduled = False
@@ -285,7 +283,9 @@ class ImageViewerApp:
         self.thumbnail_scrollbar.pack(fill=tk.X, padx=8, pady=(0, 8))
         self.thumbnail_inner.bind("<Configure>", self.on_thumbnail_inner_configure)
         self.thumbnail_canvas.bind("<Configure>", self.on_thumbnail_canvas_configure)
-        self.thumbnail_canvas.bind_all("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
+        self.thumbnail_frame.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
+        self.thumbnail_canvas.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
+        self.thumbnail_inner.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
 
         # 再生中の操作パネル
         self.seekbar_frame = tk.Frame(self.root, bg='#222222', bd=2, relief=tk.RAISED)
@@ -611,7 +611,7 @@ class ImageViewerApp:
         return None
 
     def clear_current_image_cache(self):
-        """迴ｾ蝨ｨ逕ｻ蜒上・繧ｭ繝｣繝・す繝･繧貞ｧ｣髯､"""
+        """現在画像まわりのキャッシュをクリアする"""
         self.cancel_image_open_retry()
         if self.current_source_image is not None:
             try:
@@ -689,7 +689,7 @@ class ImageViewerApp:
         start = time.perf_counter()
         self.log_resize_debug(
             f"begin_resize_session start metadata_visible={self.metadata_visible} "
-            f"overlay_visible={self.metadata_overlay_visible} thumbnail_visible={self.thumbnail_visible}"
+            f"panel_visible={self.metadata_panel_visible} thumbnail_visible={self.thumbnail_visible}"
         )
 
         if self.render_after_id:
@@ -734,39 +734,27 @@ class ImageViewerApp:
         self.set_debug_hud_value("event", "resize-end")
         self.log_resize_debug(f"end_resize_session end duration={(time.perf_counter() - start) * 1000:.1f}ms")
 
-    def hide_metadata_overlay_now(self):
-        """情報欄を可能な限り即時に隠す"""
-        if not self.metadata_overlay_visible:
-            self.log_resize_debug("hide_metadata_overlay_now skipped")
-            return
-
-        start = time.perf_counter()
-        self.log_resize_debug("hide_metadata_overlay_now start")
-        self.metadata_frame.grid_remove()
-        self.metadata_overlay_visible = False
-        self.log_resize_debug(f"hide_metadata_overlay_now end duration={(time.perf_counter() - start) * 1000:.1f}ms")
-
     def apply_panel_layout(self):
         """サムネイル帯と情報欄の表示状態をレイアウトへ反映"""
         if not self.is_slideshow_active:
-            if self.metadata_overlay_visible:
+            if self.metadata_panel_visible:
                 self.metadata_frame.grid_remove()
-                self.metadata_overlay_visible = False
+                self.metadata_panel_visible = False
             self.thumbnail_frame.grid_remove()
             self.update_thumbnail_buttons()
             self.update_metadata_button()
             return
 
-        show_metadata_overlay = self.metadata_visible and not self.panels_hidden_for_resize
+        show_metadata_panel = self.metadata_visible and not self.panels_hidden_for_resize
         show_thumbnail_strip = self.thumbnail_visible and not self.panels_hidden_for_resize
 
-        if show_metadata_overlay:
-            if not self.metadata_overlay_visible:
+        if show_metadata_panel:
+            if not self.metadata_panel_visible:
                 self.metadata_frame.grid()
-                self.metadata_overlay_visible = True
-        elif self.metadata_overlay_visible:
+                self.metadata_panel_visible = True
+        elif self.metadata_panel_visible:
             self.metadata_frame.grid_remove()
-            self.metadata_overlay_visible = False
+            self.metadata_panel_visible = False
 
         if show_thumbnail_strip:
             self.thumbnail_frame.grid()
@@ -1100,7 +1088,7 @@ class ImageViewerApp:
         self.log_timeline(f"flush_thumbnail_highlight end duration={duration_ms:.1f}ms")
 
     def show_context_menu(self, event):
-        """逕ｻ蜒上・蜿ｳ繧ｯ繝ｪ繝・け繝｡繝九Η繝ｼ繧呈款縺・"""
+        """現在画像のコンテキストメニューを表示する"""
         if not self.get_current_image_path():
             return
 
@@ -1110,7 +1098,7 @@ class ImageViewerApp:
             self.context_menu.grab_release()
 
     def copy_current_image_to_clipboard(self, event=None):
-        """迴ｾ蝨ｨ縺ｮ逕ｻ蜒上ｒ繧ｯ繝ｪ繝・・繝懊・繝峨↓繧ｳ繝斐・縺吶ｋ"""
+        """現在表示中の画像をクリップボードにコピーする"""
         image_path = self.get_current_image_path()
         if not image_path:
             return "break"
@@ -1128,7 +1116,7 @@ class ImageViewerApp:
         return "break"
 
     def reveal_current_image_in_file_manager(self):
-        """迴ｾ蝨ｨ縺ｮ逕ｻ蜒上ｒ繝輔ぃ繧､繝ｫ繝槭ロ繝ｼ繧ｸ繝｣縺ｧ陦ｨ遉ｺ"""
+        """現在表示中の画像をファイルマネージャで開く"""
         image_path = self.get_current_image_path()
         if not image_path:
             return
@@ -1139,7 +1127,7 @@ class ImageViewerApp:
             messagebox.showerror("エラー", f"ファイルマネージャで開けませんでした。\n{exc}")
 
     def reveal_in_file_manager(self, image_path):
-        """OS 縺ｫ蜷医ｏ縺帙※逕ｻ蜒上ｒ繝輔ぃ繧､繝ｫ繝槭ロ繝ｼ繧ｸ繝｣縺ｧ陦ｨ遉ｺ"""
+        """OS に合わせて画像の場所をファイルマネージャで表示する"""
         normalized_path = os.path.abspath(image_path)
         parent_dir = os.path.dirname(normalized_path)
 
@@ -1154,7 +1142,7 @@ class ImageViewerApp:
             return
 
         if sys.platform.startswith("linux"):
-            # Linux 縺ｧ縺ｯ髢狗匱繝輔ぃ繧､繝ｫ閾ｪ菴懈・縺ｮ蝣ｴ蜷医′澶ｯ縺・◆繧√√∪縺壹・隕九▽縺九ｋ縺ｮ縺ｯ莠悟・繝輔か繝ｫ繝縺ｮ繝ｼ繝励Φ縺ｫ縺ｨ縺ｩ繧√ｋ
+            # Linux では選択表示の標準 API が薄いため、親フォルダを開く。
             subprocess.run(["xdg-open", parent_dir], check=True)
             return
 
@@ -1275,6 +1263,9 @@ finally {{
         )
         label.pack(pady=(4, 0))
 
+        for widget in (item_frame, button, label):
+            widget.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
+
         self.thumbnail_buttons[image_path] = button
         self.thumbnail_items[image_path] = item_frame
         self.thumbnail_labels[image_path] = label
@@ -1318,7 +1309,7 @@ finally {{
         self.on_thumbnail_inner_configure()
 
     def on_root_configure(self, event=None):
-        """ウィンドウサイズ変更時にオーバーレイ位置を追従"""
+        """ウィンドウサイズ変更時の再描画制御"""
         if not self.is_slideshow_active:
             return
 
@@ -1377,10 +1368,6 @@ finally {{
 
         self.end_resize_session()
 
-    def update_metadata_overlay_geometry(self):
-        """情報欄は同一ウィンドウ内の右カラムで管理する"""
-        return
-
     def highlight_current_thumbnail(self):
         """現在表示中のサムネイルを強調表示"""
         current_path = None
@@ -1400,20 +1387,20 @@ finally {{
         self.schedule_thumbnail_follow(current_path)
 
     def schedule_thumbnail_follow(self, image_path):
-        """逕ｻ蜒丈ｸ庚曄繧剃ｽ懈・縺励※繧ｵ繝繝阪う繝ｫ追従繧定ｺ育ｴ・"""
+        """現在画像に合わせたサムネイル追従を予約する"""
         self.cancel_thumbnail_follow()
         self.thumbnail_follow_path = image_path
         self.thumbnail_scroll_after_id = self.root.after_idle(self.flush_thumbnail_follow)
 
     def cancel_thumbnail_follow(self):
-        """譌｢蟄倥＠縺溘し繝繝阪う繝ｫ追従繧貞ｧ｣髯､"""
+        """予約済みのサムネイル追従を取り消す"""
         if self.thumbnail_scroll_after_id:
             self.root.after_cancel(self.thumbnail_scroll_after_id)
             self.thumbnail_scroll_after_id = None
         self.thumbnail_follow_path = None
 
     def flush_thumbnail_follow(self):
-        """莠育ｴ・∩縺ｮ繧ｵ繝繝阪う繝ｫ追従繧呈悽逕ｻ"""
+        """予約済みのサムネイル追従を実行する"""
         self.thumbnail_scroll_after_id = None
         if self.thumbnail_follow_path:
             path = self.thumbnail_follow_path
@@ -1421,7 +1408,7 @@ finally {{
             self.scroll_thumbnail_into_view(path)
 
     def scroll_thumbnail_into_view(self, image_path):
-        """迴ｾ蝨ｨ縺ｮ繧ｵ繝繝阪う繝ｫ縺後∪縺ｨ繧∝商隱ｿ蜿ｯ閭ｽ蝣ｴ謨ｰ蜀・・"""
+        """現在画像のサムネイルが見える位置までスクロールする"""
         item_frame = self.thumbnail_items.get(image_path)
         if not self.thumbnail_visible or item_frame is None or not item_frame.winfo_exists():
             return
@@ -1457,7 +1444,7 @@ finally {{
         for key, value in image.info.items():
             if key == "parameters":
                 continue
-            other_info.append(f"{key}: {value}")
+            other_info.append(f"{key}: {self.format_metadata_value(value)}")
 
         if other_info:
             lines.extend(["", "[Image Info]"] + other_info)
@@ -1467,7 +1454,7 @@ finally {{
         if exif_data:
             for tag_id, value in exif_data.items():
                 tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
-                exif_lines.append(f"{tag_name}: {value}")
+                exif_lines.append(f"{tag_name}: {self.format_metadata_value(value)}")
 
         if exif_lines:
             lines.extend(["", "[EXIF]"] + exif_lines)
@@ -1476,6 +1463,23 @@ finally {{
             lines.extend(["", "画像内メタ情報は見つかりませんでした。"])
 
         return "\n".join(lines)
+
+    def format_metadata_value(self, value, max_length=240):
+        """メタ情報の値を読みやすい文字列へ整形する"""
+        if isinstance(value, bytes):
+            for encoding in ("utf-8", "utf-16", "latin-1"):
+                try:
+                    value = value.decode(encoding).rstrip("\x00")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                value = value.hex()
+
+        text = str(value)
+        if len(text) > max_length:
+            text = f"{text[:max_length]}..."
+        return text
 
     def get_metadata_text_for_path(self, image_path, image=None):
         """画像ごとのメタ情報文字列をキャッシュして返す"""
