@@ -4,8 +4,10 @@ import sys
 import time
 import queue
 import ctypes
+import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from collections import OrderedDict
 from PIL import Image, ImageTk, ExifTags, UnidentifiedImageError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -46,6 +48,9 @@ DEBUG_HUD = "hud" in DEBUG_FLAGS
 METADATA_REFRESH_DELAY_MS = 0
 THUMBNAIL_HIGHLIGHT_DELAY_MS = 0
 DEBUG_HUD_REFRESH_MS = 100
+IMAGE_OPEN_RETRY_DELAY_MS = 500
+IMAGE_OPEN_MAX_ATTEMPTS = 3
+METADATA_CACHE_MAX_ITEMS = 256
 
 if sys.platform.startswith("win"):
     WM_ENTERSIZEMOVE = 0x0231
@@ -95,6 +100,7 @@ class ImageViewerApp:
         self.thumbnail_photos = {}
         self.thumbnail_buttons = {}
         self.thumbnail_items = {}
+        self.thumbnail_labels = {}
         self.current_source_image = None
         self.current_source_path = None
         self.current_render_image = None
@@ -106,7 +112,7 @@ class ImageViewerApp:
         self.metadata_overlay_visible = False
         self.metadata_overlay_geometry = ""
         self.metadata_text_value = None
-        self.metadata_cache = {}
+        self.metadata_cache = OrderedDict()
         self.render_scheduled = False
         self.render_after_id = None
         self.layout_dirty = False
@@ -124,6 +130,8 @@ class ImageViewerApp:
         self.thumbnail_highlight_after_id = None
         self.thumbnail_highlight_target_path = None
         self.thumbnail_follow_path = None
+        self.image_open_retry_after_id = None
+        self.image_open_retry_request = None
         self.last_root_size = None
         self.native_resize_active = False
         self.native_resize_hook_installed = False
@@ -604,6 +612,7 @@ class ImageViewerApp:
 
     def clear_current_image_cache(self):
         """迴ｾ蝨ｨ逕ｻ蜒上・繧ｭ繝｣繝・す繝･繧貞ｧ｣髯､"""
+        self.cancel_image_open_retry()
         if self.current_source_image is not None:
             try:
                 self.current_source_image.close()
@@ -615,6 +624,61 @@ class ImageViewerApp:
         self.current_render_path = None
         self.current_render_size = None
         self.current_render_resample = None
+
+    def cancel_image_open_retry(self):
+        """画像オープンの遅延リトライ予約を取り消す"""
+        if self.image_open_retry_after_id:
+            self.root.after_cancel(self.image_open_retry_after_id)
+            self.image_open_retry_after_id = None
+        self.image_open_retry_request = None
+
+    def schedule_image_open_retry(
+        self,
+        image_path,
+        *,
+        resample,
+        refresh_metadata,
+        refresh_thumbnail,
+        use_preview_source,
+        open_attempt,
+    ):
+        """生成途中画像向けのオープン再試行を予約する"""
+        request = (
+            image_path,
+            resample,
+            refresh_metadata,
+            refresh_thumbnail,
+            use_preview_source,
+            open_attempt,
+        )
+        if self.image_open_retry_request == request and self.image_open_retry_after_id:
+            return
+
+        self.cancel_image_open_retry()
+        self.image_open_retry_request = request
+
+        if use_preview_source:
+            self.set_debug_hud_value("preview_status", "pending")
+        else:
+            self.set_debug_hud_value("render_status", "pending")
+
+        def retry():
+            self.image_open_retry_after_id = None
+            request_to_run = self.image_open_retry_request
+            self.image_open_retry_request = None
+            if request_to_run is None:
+                return
+            if self.get_current_image_path() != image_path:
+                return
+            self.render_current_image(
+                resample=resample,
+                refresh_metadata=refresh_metadata,
+                refresh_thumbnail=refresh_thumbnail,
+                use_preview_source=use_preview_source,
+                open_attempt=open_attempt,
+            )
+
+        self.image_open_retry_after_id = self.root.after(IMAGE_OPEN_RETRY_DELAY_MS, retry)
 
     def begin_resize_session(self):
         """リサイズ中の軽量表示モードへ切り替え"""
@@ -641,6 +705,7 @@ class ImageViewerApp:
             self.log_resize_debug("canceled pending resize_preview_after_id")
             self.set_debug_hud_value("preview_status", "idle")
 
+        self.cancel_image_open_retry()
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
         self.resume_play_after_resize = self.is_playing
@@ -1097,7 +1162,8 @@ class ImageViewerApp:
 
     def copy_pil_image_to_clipboard(self, image):
         """PIL Image を Windows クリップボードへ転送"""
-        temp_copy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".clipboard_copy_tmp.png")
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+            temp_copy_path = tmp_file.name
         image.save(temp_copy_path, "PNG")
 
         script = f"""
@@ -1164,6 +1230,54 @@ finally {{
         self.thumbnail_photos = {}
         self.thumbnail_buttons = {}
         self.thumbnail_items = {}
+        self.thumbnail_labels = {}
+
+    def get_thumbnail_photo(self, image_path):
+        """サムネイル画像を必要時だけ生成して返す"""
+        cached_photo = self.thumbnail_photos.get(image_path)
+        if cached_photo is not None:
+            return cached_photo
+
+        try:
+            with Image.open(image_path) as thumb_image:
+                thumb_image = thumb_image.copy()
+                thumb_image.thumbnail((112, 96), Image.Resampling.LANCZOS)
+        except (OSError, UnidentifiedImageError):
+            thumb_image = Image.new("RGB", (112, 96), color="#444444")
+
+        thumb_photo = ImageTk.PhotoImage(thumb_image)
+        self.thumbnail_photos[image_path] = thumb_photo
+        return thumb_photo
+
+    def add_thumbnail_item(self, index, image_path):
+        """サムネイル帯へ 1 件だけ追加する"""
+        item_frame = tk.Frame(self.thumbnail_inner, bg='#161616', padx=4, pady=4)
+        item_frame.pack(side=tk.LEFT)
+
+        button = tk.Button(
+            item_frame,
+            image=self.get_thumbnail_photo(image_path),
+            width=116,
+            height=100,
+            bd=2,
+            relief=tk.FLAT,
+            bg='#222222',
+            activebackground='#444444',
+            command=lambda i=index: self.select_image_from_thumbnail(i)
+        )
+        button.pack()
+
+        label = tk.Label(
+            item_frame,
+            text=str(index + 1),
+            bg='#161616',
+            fg='white'
+        )
+        label.pack(pady=(4, 0))
+
+        self.thumbnail_buttons[image_path] = button
+        self.thumbnail_items[image_path] = item_frame
+        self.thumbnail_labels[image_path] = label
 
     def on_thumbnail_inner_configure(self, event=None):
         """サムネイル内側フレームのサイズ変更をキャンバスへ反映"""
@@ -1192,42 +1306,14 @@ finally {{
         self.clear_thumbnail_widgets()
 
         for index, image_path in enumerate(self.image_list):
-            item_frame = tk.Frame(self.thumbnail_inner, bg='#161616', padx=4, pady=4)
-            item_frame.pack(side=tk.LEFT)
+            self.add_thumbnail_item(index, image_path)
 
-            try:
-                with Image.open(image_path) as thumb_image:
-                    thumb_image = thumb_image.copy()
-                    thumb_image.thumbnail((112, 96), Image.Resampling.LANCZOS)
-            except (OSError, UnidentifiedImageError):
-                thumb_image = Image.new("RGB", (112, 96), color="#444444")
+        self.highlight_current_thumbnail()
+        self.on_thumbnail_inner_configure()
 
-            thumb_photo = ImageTk.PhotoImage(thumb_image)
-            self.thumbnail_photos[image_path] = thumb_photo
-
-            button = tk.Button(
-                item_frame,
-                image=thumb_photo,
-                width=116,
-                height=100,
-                bd=2,
-                relief=tk.FLAT,
-                bg='#222222',
-                activebackground='#444444',
-                command=lambda i=index: self.select_image_from_thumbnail(i)
-            )
-            button.pack()
-
-            label = tk.Label(
-                item_frame,
-                text=str(index + 1),
-                bg='#161616',
-                fg='white'
-            )
-            label.pack(pady=(4, 0))
-            self.thumbnail_buttons[image_path] = button
-            self.thumbnail_items[image_path] = item_frame
-
+    def append_thumbnail_item(self, image_path):
+        """末尾追加だけで済む場合にサムネイル帯を差分更新する"""
+        self.add_thumbnail_item(len(self.image_list) - 1, image_path)
         self.highlight_current_thumbnail()
         self.on_thumbnail_inner_configure()
 
@@ -1395,6 +1481,7 @@ finally {{
         """画像ごとのメタ情報文字列をキャッシュして返す"""
         cached = self.metadata_cache.get(image_path)
         if cached is not None:
+            self.metadata_cache.move_to_end(image_path)
             return cached
 
         close_image = False
@@ -1405,6 +1492,9 @@ finally {{
         try:
             metadata_text = self.build_metadata_text(image_path, image)
             self.metadata_cache[image_path] = metadata_text
+            self.metadata_cache.move_to_end(image_path)
+            while len(self.metadata_cache) > METADATA_CACHE_MAX_ITEMS:
+                self.metadata_cache.popitem(last=False)
             return metadata_text
         finally:
             if close_image:
@@ -1455,6 +1545,7 @@ finally {{
         refresh_metadata=True,
         refresh_thumbnail=True,
         use_preview_source=False,
+        open_attempt=0,
     ):
         """現在選択中の画像を再描画"""
         start = time.perf_counter()
@@ -1478,17 +1569,27 @@ finally {{
         try:
             if self.current_source_path != image_path or self.current_source_image is None:
                 self.clear_current_image_cache()
-
-                for _ in range(3):
-                    try:
-                        with Image.open(image_path) as loaded_image:
-                            self.current_source_image = loaded_image.copy()
-                        self.current_source_path = image_path
-                        break
-                    except IOError:
-                        time.sleep(0.5)
-                else:
-                    print(f"Failed to open image: {image_path}")
+                try:
+                    with Image.open(image_path) as loaded_image:
+                        self.current_source_image = loaded_image.copy()
+                    self.current_source_path = image_path
+                    self.cancel_image_open_retry()
+                except IOError:
+                    if open_attempt + 1 < IMAGE_OPEN_MAX_ATTEMPTS:
+                        self.schedule_image_open_retry(
+                            image_path,
+                            resample=resample,
+                            refresh_metadata=refresh_metadata,
+                            refresh_thumbnail=refresh_thumbnail,
+                            use_preview_source=use_preview_source,
+                            open_attempt=open_attempt + 1,
+                        )
+                    else:
+                        print(f"Failed to open image: {image_path}")
+                        if use_preview_source:
+                            self.set_debug_hud_value("preview_status", "idle")
+                        else:
+                            self.set_debug_hud_value("render_status", "idle")
                     return
 
             if use_preview_source and self.current_render_image is not None:
@@ -1870,12 +1971,18 @@ finally {{
                 if 0 <= self.current_index < len(self.image_list):
                     current_path = self.image_list[self.current_index]
                 should_resume_from_wait = self.current_index == -1 or self.current_index == len(self.image_list) - 1
+                previous_count = len(self.image_list)
 
                 self.image_list.append(new_image)
                 self.sort_image_list(current_path=current_path)
                 print(f"New image added: {new_image}")
                 self.update_seekbar_range()
-                self.refresh_thumbnail_strip()
+                new_index = self.image_list.index(new_image)
+                appended_at_end = previous_count == len(self.image_list) - 1 and new_index == len(self.image_list) - 1
+                if appended_at_end:
+                    self.append_thumbnail_item(new_image)
+                else:
+                    self.refresh_thumbnail_strip()
                 self.metadata_cache.pop(new_image, None)
                 
                 # もし現在最後の画像を表示中で待機状態だったなら、すぐ新しい画像へ進む
