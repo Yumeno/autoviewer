@@ -317,6 +317,14 @@ class ImageViewerApp:
         )
         self.return_to_menu_button.pack(side=tk.RIGHT, padx=(10, 0))
 
+        self.quit_button = tk.Button(
+            primary_controls,
+            text="終了",
+            width=8,
+            command=self.on_closing
+        )
+        self.quit_button.pack(side=tk.RIGHT, padx=(10, 0))
+
         self.close_panel_button = tk.Button(
             primary_controls,
             text="閉じる",
@@ -394,7 +402,7 @@ class ImageViewerApp:
         tk.Button(self.menu_frame, text="2. スライドショー開始", command=self.start_slideshow, width=20, bg='#4CAF50', fg='white').pack(pady=20)
 
         # 操作説明
-        help_text = "【操作方法】\n・Escキー: フルスクリーン切替\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 設定画面へ戻る / 最大化切替 / フォルダ変更"
+        help_text = "【操作方法】\n・Escキー: フルスクリーン切替\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 設定画面へ戻る / 最大化切替 / フォルダ変更 / 終了"
         tk.Label(self.menu_frame, text=help_text, fg='#AAAAAA', bg='#333333', justify=tk.LEFT).pack(pady=10)
 
     def select_folder(self):
