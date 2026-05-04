@@ -1464,7 +1464,7 @@ finally {{
 
         return "\n".join(lines)
 
-    def format_metadata_value(self, value, max_length=240):
+    def format_metadata_value(self, value):
         """メタ情報の値を読みやすい文字列へ整形する"""
         if isinstance(value, bytes):
             for encoding in ("utf-8", "utf-16", "latin-1"):
@@ -1476,10 +1476,7 @@ finally {{
             else:
                 value = value.hex()
 
-        text = str(value)
-        if len(text) > max_length:
-            text = f"{text[:max_length]}..."
-        return text
+        return str(value)
 
     def get_metadata_text_for_path(self, image_path, image=None):
         """画像ごとのメタ情報文字列をキャッシュして返す"""
