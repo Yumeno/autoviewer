@@ -3,7 +3,6 @@ import subprocess
 import sys
 import time
 import queue
-import ctypes
 import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -11,9 +10,6 @@ from collections import OrderedDict
 from PIL import Image, ImageTk, ExifTags, UnidentifiedImageError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-
-if sys.platform.startswith("win"):
-    from ctypes import wintypes
 
 # 対応する画像フォーマット
 SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
@@ -51,21 +47,6 @@ DEBUG_HUD_REFRESH_MS = 100
 IMAGE_OPEN_RETRY_DELAY_MS = 500
 IMAGE_OPEN_MAX_ATTEMPTS = 3
 METADATA_CACHE_MAX_ITEMS = 256
-
-if sys.platform.startswith("win"):
-    WM_ENTERSIZEMOVE = 0x0231
-    WM_EXITSIZEMOVE = 0x0232
-    WM_SIZE = 0x0005
-    WM_WINDOWPOSCHANGING = 0x0046
-    WM_WINDOWPOSCHANGED = 0x0047
-    WM_SYSCOMMAND = 0x0112
-    WM_NCLBUTTONDOWN = 0x00A1
-    GWLP_WNDPROC = -4
-    SW_HIDE = 0
-    GA_ROOT = 2
-    GA_ROOTOWNER = 3
-    GW_OWNER = 4
-    SC_SIZE = 0xF000
 
 class NewImageHandler(FileSystemEventHandler):
     """フォルダに新しいファイルが追加されたことを検知するハンドラ"""
@@ -131,17 +112,6 @@ class ImageViewerApp:
         self.image_open_retry_after_id = None
         self.image_open_retry_request = None
         self.last_root_size = None
-        self.native_resize_active = False
-        self.native_resize_hook_installed = False
-        self.native_resize_hwnd = None
-        self.native_resize_hwnds = []
-        self.native_resize_hwnd_labels = {}
-        self.native_resize_orig_procs = {}
-        self.default_wndproc = None
-        self.window_proc = None
-        self.last_native_resize_enter_at = None
-        self.last_native_resize_exit_at = None
-        self.last_native_resize_source = None
         self.timeline_event_seq = 0
         self.debug_hud_label = None
         self.debug_hud_after_id = None
@@ -165,7 +135,6 @@ class ImageViewerApp:
 
         # UI要素の構築
         self.setup_ui()
-        self.install_native_resize_hook()
         self.sync_interval_ui()
         self.update_play_pause_button()
         self.update_fullscreen_button()
@@ -173,7 +142,7 @@ class ImageViewerApp:
         self.set_metadata_text("画像情報を表示するには、再生中に情報欄を開いてください。")
         
         # キーバインド
-        self.root.bind("<Escape>", self.exit_fullscreen)
+        self.root.bind("<Escape>", self.on_escape)
         self.root.bind("<Right>", lambda e: self.next_image())
         self.root.bind("<Left>", lambda e: self.prev_image())
         self.root.bind("<space>", lambda e: self.next_image())
@@ -340,6 +309,14 @@ class ImageViewerApp:
             bg='#222222'
         ).pack(side=tk.LEFT)
 
+        self.return_to_menu_button = tk.Button(
+            primary_controls,
+            text="設定画面へ戻る",
+            width=14,
+            command=self.return_to_menu
+        )
+        self.return_to_menu_button.pack(side=tk.RIGHT, padx=(10, 0))
+
         self.close_panel_button = tk.Button(
             primary_controls,
             text="閉じる",
@@ -417,7 +394,7 @@ class ImageViewerApp:
         tk.Button(self.menu_frame, text="2. スライドショー開始", command=self.start_slideshow, width=20, bg='#4CAF50', fg='white').pack(pady=20)
 
         # 操作説明
-        help_text = "【操作方法】\n・Escキー: 設定画面に戻る\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 最大化切替 / フォルダ変更"
+        help_text = "【操作方法】\n・Escキー: フルスクリーン切替\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 設定画面へ戻る / 最大化切替 / フォルダ変更"
         tk.Label(self.menu_frame, text=help_text, fg='#AAAAAA', bg='#333333', justify=tk.LEFT).pack(pady=10)
 
     def select_folder(self):
@@ -504,26 +481,6 @@ class ImageViewerApp:
             return
         self.timeline_event_seq += 1
         print(f"[timeline {time.perf_counter():.6f} #{self.timeline_event_seq}] {message}")
-
-    def log_native_probe(self, hwnd_value, msg, wparam, lparam):
-        if not DEBUG_RESIZE_LOG:
-            return
-
-        source = self.native_resize_hwnd_labels.get(hwnd_value, str(hwnd_value))
-        if msg == WM_NCLBUTTONDOWN:
-            self.log_resize_debug(
-                f"native probe source={source} msg=WM_NCLBUTTONDOWN wparam={int(wparam)} lparam={int(lparam)}"
-            )
-        elif msg == WM_SYSCOMMAND:
-            command = int(wparam) & 0xFFF0
-            suffix = " SC_SIZE" if command == SC_SIZE else ""
-            self.log_resize_debug(
-                f"native probe source={source} msg=WM_SYSCOMMAND cmd=0x{command:04X} raw=0x{int(wparam):04X}{suffix}"
-            )
-        elif msg == WM_SIZE:
-            self.log_resize_debug(
-                f"native probe source={source} msg=WM_SIZE wparam={int(wparam)} lparam={int(lparam)}"
-            )
 
     def set_debug_hud_value(self, key, value):
         """デバッグ HUD 用の最新値を保持する"""
@@ -763,221 +720,6 @@ class ImageViewerApp:
 
         self.update_thumbnail_buttons()
         self.update_metadata_button()
-
-    def install_native_resize_hook(self):
-        """Windows ではネイティブメッセージでサイズ変更開始/終了を拾う"""
-        if not sys.platform.startswith("win") or self.native_resize_hook_installed:
-            return
-
-        try:
-            self.root.update_idletasks()
-            user32 = ctypes.windll.user32
-            get_parent = user32.GetParent
-            get_ancestor = user32.GetAncestor
-            get_window = user32.GetWindow
-            set_window_long_ptr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-            call_window_proc = user32.CallWindowProcW
-
-            wndproc_type = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t,
-                wintypes.HWND,
-                wintypes.UINT,
-                wintypes.WPARAM,
-                wintypes.LPARAM,
-            )
-
-            get_parent.restype = wintypes.HWND
-            get_parent.argtypes = [wintypes.HWND]
-            get_ancestor.restype = wintypes.HWND
-            get_ancestor.argtypes = [wintypes.HWND, wintypes.UINT]
-            get_window.restype = wintypes.HWND
-            get_window.argtypes = [wintypes.HWND, wintypes.UINT]
-            set_window_long_ptr.restype = ctypes.c_void_p
-            set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-            call_window_proc.restype = ctypes.c_ssize_t
-            call_window_proc.argtypes = [
-                ctypes.c_void_p,
-                wintypes.HWND,
-                wintypes.UINT,
-                wintypes.WPARAM,
-                wintypes.LPARAM,
-            ]
-
-            def window_proc(hwnd_value, msg, wparam, lparam):
-                if msg in {
-                    WM_NCLBUTTONDOWN,
-                    WM_SYSCOMMAND,
-                    WM_SIZE,
-                    WM_WINDOWPOSCHANGING,
-                    WM_WINDOWPOSCHANGED,
-                }:
-                    self.log_native_probe(hwnd_value, msg, wparam, lparam)
-                if msg == WM_ENTERSIZEMOVE:
-                    self.last_native_resize_enter_at = time.perf_counter()
-                    self.last_native_resize_source = self.native_resize_hwnd_labels.get(hwnd_value, str(hwnd_value))
-                    self.root.after(0, self.on_native_resize_enter)
-                elif msg == WM_EXITSIZEMOVE:
-                    self.last_native_resize_exit_at = time.perf_counter()
-                    self.last_native_resize_source = self.native_resize_hwnd_labels.get(hwnd_value, str(hwnd_value))
-                    self.root.after(0, self.on_native_resize_exit)
-
-                default_proc = self.native_resize_orig_procs.get(hwnd_value)
-                if default_proc:
-                    return call_window_proc(default_proc, hwnd_value, msg, wparam, lparam)
-                return 0
-
-            self.window_proc = wndproc_type(window_proc)
-            base_hwnd = self.root.winfo_id()
-            candidates = []
-            seen = set()
-
-            def add_candidate(label, hwnd_value):
-                if not hwnd_value or hwnd_value in seen:
-                    return
-                seen.add(hwnd_value)
-                candidates.append((label, hwnd_value))
-
-            parent_hwnd = get_parent(base_hwnd)
-            root_hwnd = get_ancestor(base_hwnd, GA_ROOT)
-            rootowner_hwnd = get_ancestor(base_hwnd, GA_ROOTOWNER)
-            owner_base_hwnd = get_window(base_hwnd, GW_OWNER)
-            parent_parent_hwnd = get_parent(parent_hwnd) if parent_hwnd else 0
-            parent_root_hwnd = get_ancestor(parent_hwnd, GA_ROOT) if parent_hwnd else 0
-            parent_rootowner_hwnd = get_ancestor(parent_hwnd, GA_ROOTOWNER) if parent_hwnd else 0
-            owner_parent_hwnd = get_window(parent_hwnd, GW_OWNER) if parent_hwnd else 0
-            owner_root_hwnd = get_window(root_hwnd, GW_OWNER) if root_hwnd else 0
-
-            add_candidate("parent", parent_hwnd)
-            add_candidate("root", root_hwnd)
-            add_candidate("rootowner", rootowner_hwnd)
-            add_candidate("owner_base", owner_base_hwnd)
-            add_candidate("parent_parent", parent_parent_hwnd)
-            add_candidate("parent_root", parent_root_hwnd)
-            add_candidate("parent_rootowner", parent_rootowner_hwnd)
-            add_candidate("owner_parent", owner_parent_hwnd)
-            add_candidate("owner_root", owner_root_hwnd)
-            add_candidate("base", base_hwnd)
-
-            self.log_resize_debug(
-                "native resize hwnd graph="
-                + ", ".join(
-                    [
-                        f"base:{base_hwnd}",
-                        f"parent:{parent_hwnd}",
-                        f"root:{root_hwnd}",
-                        f"rootowner:{rootowner_hwnd}",
-                        f"owner_base:{owner_base_hwnd}",
-                        f"parent_parent:{parent_parent_hwnd}",
-                        f"parent_root:{parent_root_hwnd}",
-                        f"parent_rootowner:{parent_rootowner_hwnd}",
-                        f"owner_parent:{owner_parent_hwnd}",
-                        f"owner_root:{owner_root_hwnd}",
-                    ]
-                )
-            )
-
-            for label, hwnd in candidates:
-                original_proc = set_window_long_ptr(hwnd, GWLP_WNDPROC, self.window_proc)
-                if original_proc:
-                    self.native_resize_orig_procs[hwnd] = original_proc
-                    self.native_resize_hwnd_labels[hwnd] = label
-                    self.native_resize_hwnds.append(hwnd)
-
-            if self.native_resize_hwnds:
-                self.native_resize_hwnd = self.native_resize_hwnds[0]
-                self.default_wndproc = self.native_resize_orig_procs[self.native_resize_hwnd]
-                self.native_resize_hook_installed = True
-                self.log_resize_debug(
-                    "native resize hook candidates="
-                    + ", ".join(
-                        f"{self.native_resize_hwnd_labels[hwnd]}:{hwnd}"
-                        for hwnd in self.native_resize_hwnds
-                    )
-                )
-            else:
-                self.native_resize_hook_installed = False
-        except Exception as exc:
-            print(f"Native resize hook unavailable: {exc}")
-            self.window_proc = None
-            self.default_wndproc = None
-            self.native_resize_hwnd = None
-            self.native_resize_hwnds = []
-            self.native_resize_hwnd_labels = {}
-            self.native_resize_orig_procs = {}
-            self.native_resize_hook_installed = False
-
-    def uninstall_native_resize_hook(self):
-        """Windows のサブクラス化を元に戻す"""
-        if (
-            not sys.platform.startswith("win")
-            or not self.native_resize_hook_installed
-            or not self.native_resize_hwnds
-        ):
-            return
-
-        try:
-            user32 = ctypes.windll.user32
-            set_window_long_ptr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-            set_window_long_ptr.restype = ctypes.c_void_p
-            set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-            for hwnd in self.native_resize_hwnds:
-                original_proc = self.native_resize_orig_procs.get(hwnd)
-                if original_proc:
-                    set_window_long_ptr(hwnd, GWLP_WNDPROC, original_proc)
-        except Exception as exc:
-            print(f"Failed to restore window procedure: {exc}")
-        finally:
-            self.native_resize_hook_installed = False
-            self.native_resize_hwnd = None
-            self.native_resize_hwnds = []
-            self.native_resize_hwnd_labels = {}
-            self.native_resize_orig_procs = {}
-            self.default_wndproc = None
-            self.window_proc = None
-
-    def on_native_resize_enter(self):
-        """Windows のサイズ変更モード開始を処理"""
-        if not self.is_slideshow_active:
-            return
-
-        if self.last_native_resize_enter_at is not None:
-            delay_ms = (time.perf_counter() - self.last_native_resize_enter_at) * 1000
-            self.log_resize_debug(
-                f"on_native_resize_enter source={self.last_native_resize_source} callback delay={delay_ms:.1f}ms"
-            )
-        else:
-            self.log_resize_debug("on_native_resize_enter callback delay=unknown")
-
-        self.native_resize_active = True
-        self.begin_resize_session()
-
-    def on_native_resize_exit(self):
-        """Windows のサイズ変更モード終了を処理"""
-        if not self.native_resize_active:
-            return
-
-        if self.last_native_resize_exit_at is not None:
-            delay_ms = (time.perf_counter() - self.last_native_resize_exit_at) * 1000
-            self.log_resize_debug(
-                f"on_native_resize_exit source={self.last_native_resize_source} callback delay={delay_ms:.1f}ms"
-            )
-        else:
-            self.log_resize_debug("on_native_resize_exit callback delay=unknown")
-
-        self.native_resize_active = False
-
-        if self.resize_after_id:
-            self.root.after_cancel(self.resize_after_id)
-            self.resize_after_id = None
-        if self.resize_preview_after_id:
-            self.root.after_cancel(self.resize_preview_after_id)
-            self.resize_preview_after_id = None
-
-        if self.is_slideshow_active:
-            self.end_resize_session()
-        else:
-            self.is_live_resizing = False
-            self.panels_hidden_for_resize = False
 
     def set_metadata_text(self, text):
         """情報欄のテキストを更新"""
@@ -1325,9 +1067,6 @@ finally {{
         if not size_changed:
             return
 
-        if self.native_resize_active:
-            self.log_resize_debug(f"configure during native resize size={current_size}")
-
         resize_just_started = not self.is_live_resizing
         if resize_just_started:
             self.log_resize_debug(f"configure begin fallback size={current_size}")
@@ -1361,9 +1100,6 @@ finally {{
         """連続するConfigureイベント後に再描画をまとめて実行"""
         self.resize_after_id = None
         if not self.is_slideshow_active:
-            return
-
-        if self.native_resize_active:
             return
 
         self.end_resize_session()
@@ -1793,8 +1529,8 @@ finally {{
         self.request_render(layout=True)
         self.refresh_current_folder()
 
-    def exit_fullscreen(self, event=None):
-        """フルスクリーン解除・設定メニュー表示"""
+    def return_to_menu(self):
+        """再生を止めて設定画面へ戻る"""
         self.is_slideshow_active = False
         self.set_fullscreen_state(False)
         self.menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
@@ -1810,7 +1546,6 @@ finally {{
             self.root.after_cancel(self.resize_preview_after_id)
             self.resize_preview_after_id = None
         self.is_live_resizing = False
-        self.native_resize_active = False
         self.panels_hidden_for_resize = False
         self.resume_play_after_resize = False
         self.cancel_metadata_refresh()
@@ -1826,6 +1561,14 @@ finally {{
         self.stop_observer()
         self.clear_image_queue()
         self.request_render(layout=True)
+
+    def on_escape(self, event=None):
+        """再生中は Esc でフルスクリーン表示を切り替える"""
+        if not self.is_slideshow_active:
+            return
+
+        self.toggle_fullscreen_mode()
+        return "break"
 
     def show_image(self, index):
         """指定したインデックスの画像を表示"""
@@ -1999,7 +1742,6 @@ finally {{
         """アプリ終了時の処理"""
         self.stop_observer()
         self.clear_current_image_cache()
-        self.uninstall_native_resize_hook()
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
         self.cancel_thumbnail_follow()
