@@ -91,6 +91,27 @@ macOS / Linux では、次のコマンドで起動できます。
 * **Canvas外での利用について:** 本アプリはPC内のフォルダを監視する性質上、Webブラウザ（CanvasやGoogleサイト）の中では動作しません。必ず上記の「ローカルPCでの実行」手順でご利用ください。  
 * **Gemini API（AI機能）について:** 本アプリは生成AI機能を使用していないため、APIキーの設定等は一切不要です。情報漏洩の心配なく社内ネットワーク内で安全にご利用いただけます。
 
+## **開発者向けデバッグ起動**
+
+通常の起動スクリプト (`start.bat` / `start.ps1` / `start.sh`) では、デバッグ機能は有効になりません。  
+開発時だけ、`viewer.py` を直接起動して `--debug` オプションを指定してください。
+
+例:
+
+```bash
+python viewer.py --debug resize
+python viewer.py --debug resize,timeline
+python viewer.py --debug resize,timeline,hud
+```
+
+指定できる項目:
+
+* `resize`: リサイズまわりの詳細ログを標準出力へ表示
+* `timeline`: 画像切替や再描画の時系列ログを標準出力へ表示
+* `hud`: 画面左上に軽量なデバッグ HUD を表示
+
+これらは開発者向け機能です。通常利用や配布時は、起動スクリプト経由の起動を推奨します。
+
 ## **更新履歴**
 
 * **v1.7**  

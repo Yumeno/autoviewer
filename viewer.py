@@ -4,7 +4,6 @@ import sys
 import time
 import queue
 import ctypes
-import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ExifTags, UnidentifiedImageError
@@ -19,18 +18,34 @@ SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
 MIN_INTERVAL_SECONDS = 1.0
 MAX_INTERVAL_SECONDS = 30.0
 INTERVAL_STEP_SECONDS = 0.5
-DEBUG_RESIZE_LOG = os.environ.get("AUTOVIEWER_DEBUG_RESIZE") == "1"
-DEBUG_OVERLAY_DISABLE_ALPHA = os.environ.get("AUTOVIEWER_DEBUG_OVERLAY_DISABLE_ALPHA") == "1"
-DEBUG_OVERLAY_DISABLE_TRANSIENT = os.environ.get("AUTOVIEWER_DEBUG_OVERLAY_DISABLE_TRANSIENT") == "1"
-DEBUG_OVERLAY_DISABLE_OVERRIDE = os.environ.get("AUTOVIEWER_DEBUG_OVERLAY_DISABLE_OVERRIDE") == "1"
-DEBUG_TIMELINE_LOG = os.environ.get("AUTOVIEWER_DEBUG_TIMELINE") == "1"
-DEBUG_HUD = os.environ.get("AUTOVIEWER_DEBUG_HUD") == "1"
-DEBUG_RESIZE_PROBE = os.environ.get("AUTOVIEWER_DEBUG_RESIZE_PROBE") == "1"
+
+# Development-only debug switches.
+# Example:
+#   python viewer.py --debug resize,timeline,hud
+# End-user launchers do not pass this option, so debug features stay off unless
+# a developer enables them explicitly.
+def parse_debug_flags(argv):
+    flags = set()
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--debug" and index + 1 < len(argv):
+            flags.update(part.strip().lower() for part in argv[index + 1].split(",") if part.strip())
+            index += 2
+            continue
+        if arg.startswith("--debug="):
+            flags.update(part.strip().lower() for part in arg.split("=", 1)[1].split(",") if part.strip())
+        index += 1
+    return flags
+
+
+DEBUG_FLAGS = parse_debug_flags(sys.argv[1:])
+DEBUG_RESIZE_LOG = "resize" in DEBUG_FLAGS
+DEBUG_TIMELINE_LOG = "timeline" in DEBUG_FLAGS
+DEBUG_HUD = "hud" in DEBUG_FLAGS
 METADATA_REFRESH_DELAY_MS = 0
 THUMBNAIL_HIGHLIGHT_DELAY_MS = 0
 DEBUG_HUD_REFRESH_MS = 100
-RESIZE_PROBE_POLL_MS = 33
-RESIZE_PROBE_EDGE_PX = 14
 
 if sys.platform.startswith("win"):
     WM_ENTERSIZEMOVE = 0x0231
@@ -46,7 +61,6 @@ if sys.platform.startswith("win"):
     GA_ROOTOWNER = 3
     GW_OWNER = 4
     SC_SIZE = 0xF000
-    VK_LBUTTON = 0x01
 
 class NewImageHandler(FileSystemEventHandler):
     """フォルダに新しいファイルが追加されたことを検知するハンドラ"""
@@ -122,14 +136,6 @@ class ImageViewerApp:
         self.last_native_resize_enter_at = None
         self.last_native_resize_exit_at = None
         self.last_native_resize_source = None
-        self.resize_probe_hwnd = None
-        self.resize_probe_candidate_at = None
-        self.resize_probe_candidate_edge = None
-        self.resize_probe_candidate_cursor = None
-        self.resize_probe_candidate_consumed = False
-        self.resize_probe_left_down = False
-        self.resize_probe_thread = None
-        self.resize_probe_stop_event = None
         self.timeline_event_seq = 0
         self.debug_hud_label = None
         self.debug_hud_after_id = None
@@ -154,7 +160,6 @@ class ImageViewerApp:
         # UI要素の構築
         self.setup_ui()
         self.install_native_resize_hook()
-        self.start_resize_probe()
         self.sync_interval_ui()
         self.update_play_pause_button()
         self.update_fullscreen_button()
@@ -511,86 +516,6 @@ class ImageViewerApp:
             self.log_resize_debug(
                 f"native probe source={source} msg=WM_SIZE wparam={int(wparam)} lparam={int(lparam)}"
             )
-        elif msg == WM_WINDOWPOSCHANGING:
-            if self.resize_probe_candidate_at is not None and not self.resize_probe_candidate_consumed:
-                delta_ms = (time.perf_counter() - self.resize_probe_candidate_at) * 1000
-                self.log_resize_debug(
-                    f"resize probe -> WM_WINDOWPOSCHANGING delta={delta_ms:.1f}ms "
-                    f"edge={self.resize_probe_candidate_edge} cursor={self.resize_probe_candidate_cursor}"
-                )
-                self.resize_probe_candidate_consumed = True
-
-    def start_resize_probe(self):
-        if not DEBUG_RESIZE_PROBE or not sys.platform.startswith("win"):
-            return
-        if self.resize_probe_thread and self.resize_probe_thread.is_alive():
-            return
-        self.resize_probe_hwnd = self.native_resize_hwnd or self.root.winfo_id()
-        self.resize_probe_stop_event = threading.Event()
-        self.resize_probe_thread = threading.Thread(
-            target=self.run_resize_probe_loop,
-            name="autoviewer-resize-probe",
-            daemon=True,
-        )
-        self.resize_probe_thread.start()
-
-    def run_resize_probe_loop(self):
-        if not DEBUG_RESIZE_PROBE or not sys.platform.startswith("win"):
-            return
-
-        user32 = ctypes.windll.user32
-        while self.resize_probe_stop_event and not self.resize_probe_stop_event.wait(RESIZE_PROBE_POLL_MS / 1000.0):
-            if not self.is_slideshow_active:
-                continue
-
-            try:
-                if self.resize_probe_hwnd is None:
-                    continue
-
-                point = wintypes.POINT()
-                rect = wintypes.RECT()
-                if not user32.GetCursorPos(ctypes.byref(point)):
-                    continue
-                if not user32.GetWindowRect(self.resize_probe_hwnd, ctypes.byref(rect)):
-                    continue
-
-                left_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
-                x = int(point.x)
-                y = int(point.y)
-                left = int(rect.left)
-                top = int(rect.top)
-                right = int(rect.right)
-                bottom = int(rect.bottom)
-
-                edge = None
-                near_left = abs(x - left) <= RESIZE_PROBE_EDGE_PX and top <= y <= bottom
-                near_right = abs(x - right) <= RESIZE_PROBE_EDGE_PX and top <= y <= bottom
-                near_top = abs(y - top) <= RESIZE_PROBE_EDGE_PX and left <= x <= right
-                near_bottom = abs(y - bottom) <= RESIZE_PROBE_EDGE_PX and left <= x <= right
-
-                if near_left:
-                    edge = "left"
-                elif near_right:
-                    edge = "right"
-                elif near_top:
-                    edge = "top"
-                elif near_bottom:
-                    edge = "bottom"
-
-                if left_down and not self.resize_probe_left_down and edge and not self.is_live_resizing:
-                    self.resize_probe_candidate_at = time.perf_counter()
-                    self.resize_probe_candidate_edge = edge
-                    self.resize_probe_candidate_cursor = (x, y)
-                    self.resize_probe_candidate_consumed = False
-                    self.log_resize_debug(
-                        f"resize probe candidate edge={edge} cursor=({x}, {y}) rect=({left}, {top}, {right}, {bottom})"
-                    )
-                elif not left_down and self.resize_probe_left_down:
-                    self.resize_probe_candidate_consumed = False
-
-                self.resize_probe_left_down = left_down
-            except Exception as exc:
-                self.log_resize_debug(f"resize probe error: {exc}")
 
     def set_debug_hud_value(self, key, value):
         """デバッグ HUD 用の最新値を保持する"""
@@ -700,10 +625,7 @@ class ImageViewerApp:
         start = time.perf_counter()
         self.log_resize_debug(
             f"begin_resize_session start metadata_visible={self.metadata_visible} "
-            f"overlay_visible={self.metadata_overlay_visible} thumbnail_visible={self.thumbnail_visible} "
-            f"alpha_disabled={DEBUG_OVERLAY_DISABLE_ALPHA} "
-            f"transient_disabled={DEBUG_OVERLAY_DISABLE_TRANSIENT} "
-            f"override_disabled={DEBUG_OVERLAY_DISABLE_OVERRIDE}"
+            f"overlay_visible={self.metadata_overlay_visible} thumbnail_visible={self.thumbnail_visible}"
         )
 
         if self.render_after_id:
@@ -1331,13 +1253,6 @@ finally {{
 
         resize_just_started = not self.is_live_resizing
         if resize_just_started:
-            if self.resize_probe_candidate_at is not None and not self.resize_probe_candidate_consumed:
-                delta_ms = (time.perf_counter() - self.resize_probe_candidate_at) * 1000
-                self.log_resize_debug(
-                    f"resize probe -> configure delta={delta_ms:.1f}ms "
-                    f"edge={self.resize_probe_candidate_edge} cursor={self.resize_probe_candidate_cursor}"
-                )
-                self.resize_probe_candidate_consumed = True
             self.log_resize_debug(f"configure begin fallback size={current_size}")
             self.begin_resize_session()
 
@@ -1977,12 +1892,6 @@ finally {{
         self.stop_observer()
         self.clear_current_image_cache()
         self.uninstall_native_resize_hook()
-        if self.resize_probe_stop_event:
-            self.resize_probe_stop_event.set()
-        if self.resize_probe_thread and self.resize_probe_thread.is_alive():
-            self.resize_probe_thread.join(timeout=0.2)
-        self.resize_probe_thread = None
-        self.resize_probe_stop_event = None
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
         self.cancel_thumbnail_follow()
