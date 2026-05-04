@@ -5,34 +5,57 @@
 
 ![実行イメージ](sample_screenshot.jpg)
 
-## **【準備】初めて使うとき**
+## **導入手順**
 
-本アプリを動かすには、お使いのPCに「Python（パイソン）」というプログラムの実行環境が必要です。
+### **1. 前提**
 
-1. **Pythonのインストール（未導入の場合）**  
-   * [Python公式サイト (python.org)](https://www.python.org/downloads/) からインストーラーをダウンロードします。  
-   * インストーラーを起動したら、**画面下部の Add python.exe to PATH (または Add Python to PATH) というチェックボックスに必ずチェックを入れてから** Install Now をクリックしてください。  
-2. **ファイルの保存**  
-   * アプリ本体である viewer.py と、起動用の start.bat を、PC内の同じフォルダ（デスクトップなど）に保存してください。
+本アプリを動かすには、PC に **Python 3** の実行環境が必要です。
 
-## **起動方法（ローカルPCでの実行）**
+### **Windows**
 
-1. 保存した **start.bat をダブルクリック**します。  
-2. 黒い画面が立ち上がり、初回起動時は自動で必要な拡張機能（Pillow, watchdog）をインストールします。  
-3. 準備が完了すると、自動的に設定画面が立ち上がります。
+* [Python公式サイト (python.org)](https://www.python.org/downloads/) からインストーラーをダウンロードします。  
+* インストーラーを起動したら、**画面下部の Add python.exe to PATH (または Add Python to PATH) にチェックを入れてから** Install Now をクリックしてください。
 
-PowerShell から起動する場合は、`start.ps1` を直接ダブルクリックするのではなく、次のコマンドで実行してください。  
-`powershell -ExecutionPolicy Bypass -File .\start.ps1`
+### **macOS / Linux**
 
-macOS / Linux では、次のコマンドで起動できます。  
-`chmod +x ./start.sh`  
-`./start.sh`
+* ターミナルで `python3 --version` を実行し、Python 3 が使えることを確認してください。  
+* 未導入の場合は、各OSの標準的な方法で Python 3 をインストールしてください。
+
+### **2. ファイルを置く**
+
+同じフォルダに以下を置いてください。
+
+### **Windows**
+
+* `viewer.py`
+* `start.bat` または `start.ps1`
+
+### **macOS / Linux**
+
+* `viewer.py`
+* `start.sh`
+
+### **3. まずはそのまま起動する**
 
 起動スクリプトは、リポジトリ内の `.venv` を優先して使います。`.venv` がまだ無い場合は、初回起動時に自動作成して必要パッケージを入れます。
 
-## **インストール**
+### **Windows**
 
-依存パッケージを先に入れておきたい場合は、OS ごとのインストールスクリプトを使ってください。どの方法でも、依存関係はリポジトリ内の `.venv` に入ります。
+* `start.bat` をダブルクリック  
+* PowerShell から起動する場合: `powershell -ExecutionPolicy Bypass -File .\start.ps1`
+
+### **macOS / Linux**
+
+```bash
+chmod +x ./start.sh
+./start.sh
+```
+
+準備が完了すると、自動的に設定画面が立ち上がります。
+
+### **4. 依存パッケージだけ先に入れたい場合（任意）**
+
+初回起動時の自動セットアップを待たず、依存パッケージを先に入れておきたい場合は、次のインストールスクリプトを使ってください。依存関係はどの方法でもリポジトリ内の `.venv` に入ります。
 
 ### **Windows**
 
@@ -41,8 +64,10 @@ macOS / Linux では、次のコマンドで起動できます。
 
 ### **macOS / Linux**
 
-* `chmod +x ./install.sh`  
-* `./install.sh`
+```bash
+chmod +x ./install.sh
+./install.sh
+```
 
 インストール後の起動は `start.bat` / `start.ps1` / `start.sh` を使ってください。
 
