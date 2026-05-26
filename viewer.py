@@ -2,20 +2,28 @@ import os
 import subprocess
 import sys
 import time
-import queue
 import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from collections import OrderedDict
 from PIL import Image, ImageTk, ExifTags, UnidentifiedImageError
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 # 対応する画像フォーマット
 SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
 MIN_INTERVAL_SECONDS = 1.0
 MAX_INTERVAL_SECONDS = 30.0
 INTERVAL_STEP_SECONDS = 0.5
+
+# フォルダ監視 (ポーリング差分方式)
+POLL_INTERVAL_DEFAULT_MS = 250
+POLL_INTERVAL_MIN_MS = 100
+POLL_INTERVAL_MAX_MS = 5000
+# 確定までの最低安定時間 (新規 / 変化を image_list へ反映するまで mtime/size が
+# 変わらない期間)。実値は max(POLL_SETTLE_MULTIPLIER * interval, POLL_SETTLE_MIN_MS)。
+POLL_SETTLE_MULTIPLIER = 2
+POLL_SETTLE_MIN_MS = 500
+# 単発チェックボタンの 2 回スキャン間隔
+MANUAL_CHECK_GAP_MS = 100
 
 # Development-only debug switches.
 # Example:
@@ -109,18 +117,6 @@ def find_path_index(image_list, path):
     return -1
 
 
-class NewImageHandler(FileSystemEventHandler):
-    """フォルダに新しいファイルが追加されたことを検知するハンドラ"""
-    def __init__(self, image_queue):
-        self.image_queue = image_queue
-
-    def on_created(self, event):
-        if not event.is_directory:
-            ext = os.path.splitext(event.src_path)[1].lower()
-            if ext in SUPPORTED_EXTS:
-                # 新しい画像パスをキューに追加
-                self.image_queue.put(event.src_path)
-
 class ImageViewerApp:
     def __init__(self, root):
         self.root = root
@@ -190,16 +186,22 @@ class ImageViewerApp:
         # タップ・スワイプ判定用
         self.start_x = None
         
-        # 監視用
-        self.observer = None
-        self.image_queue = queue.Queue()
-        self.folder_snapshot = {}  # {path: (mtime_ns, size)} 差分検出の基準
+        # フォルダ監視 (ポーリング差分方式)
+        self.folder_snapshot = {}  # {path: (mtime_ns, size)} 確定済みの基準スナップショット
+        self.pending_changes = {}  # {path: ((mtime_ns, size), first_seen_perf)} settle 待ち
+        self.poll_after_id = None
+        self.poll_interval_ms = POLL_INTERVAL_DEFAULT_MS
+        self.polling_enabled = True
+        self.manual_check_after_id = None
+        self.poll_interval_setting_var = tk.IntVar(value=POLL_INTERVAL_DEFAULT_MS)
+        self.polling_enabled_setting_var = tk.BooleanVar(value=True)
 
         # UI要素の構築
         self.setup_ui()
         self.sync_interval_ui()
         self.update_play_pause_button()
         self.update_fullscreen_button()
+        self.update_polling_status_ui()
         self.apply_panel_layout()
         self.set_metadata_text("画像情報を表示するには、再生中に情報欄を開いてください。")
         
@@ -213,8 +215,7 @@ class ImageViewerApp:
         self.root.bind("<Control-c>", self.copy_current_image_to_clipboard)
         self.root.bind("<Configure>", self.on_root_configure)
 
-        # キューの定期チェックを開始
-        self.check_queue()
+        # ポーリングは start_slideshow / refresh_current_folder のタイミングで開始される。
 
     def setup_ui(self):
         """設定画面と画像表示画面の構築"""
@@ -412,7 +413,23 @@ class ImageViewerApp:
             width=12,
             command=self.toggle_metadata_panel
         )
-        self.metadata_toggle_button.pack(side=tk.LEFT)
+        self.metadata_toggle_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.polling_toggle_button = tk.Button(
+            secondary_controls,
+            text="監視ON",
+            width=10,
+            command=self.toggle_polling,
+        )
+        self.polling_toggle_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.manual_check_button = tk.Button(
+            secondary_controls,
+            text="即時チェック",
+            width=12,
+            command=self.request_manual_check,
+        )
+        self.manual_check_button.pack(side=tk.LEFT)
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(
@@ -461,10 +478,37 @@ class ImageViewerApp:
         tk.Label(interval_frame, text="自動送り間隔 (秒):", fg='white', bg='#333333').pack(side=tk.LEFT)
         tk.Entry(interval_frame, textvariable=self.interval_var, width=5).pack(side=tk.LEFT, padx=5)
 
+        # 監視設定 (起動時のデフォルト値)。再生中の操作パネルとは分離してある。
+        watch_frame = tk.Frame(self.menu_frame, bg='#333333')
+        watch_frame.pack(pady=5)
+        tk.Checkbutton(
+            watch_frame,
+            text="自動監視を有効にする",
+            variable=self.polling_enabled_setting_var,
+            fg='white',
+            bg='#333333',
+            selectcolor='#222222',
+            activebackground='#333333',
+            activeforeground='white',
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        tk.Label(watch_frame, text="監視間隔 (ms):", fg='white', bg='#333333').pack(side=tk.LEFT)
+        tk.Entry(
+            watch_frame,
+            textvariable=self.poll_interval_setting_var,
+            width=6,
+        ).pack(side=tk.LEFT, padx=5)
+        tk.Label(
+            self.menu_frame,
+            text=f"  ※ 範囲 {POLL_INTERVAL_MIN_MS}〜{POLL_INTERVAL_MAX_MS} ms。実検知レイテンシは目安 2 × 監視間隔。",
+            fg='#888888',
+            bg='#333333',
+            justify=tk.LEFT,
+        ).pack(pady=(0, 5))
+
         tk.Button(self.menu_frame, text="2. スライドショー開始", command=self.start_slideshow, width=20, bg='#4CAF50', fg='white').pack(pady=20)
 
         # 操作説明
-        help_text = "【操作方法】\n・Escキー: フルスクリーン切替\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 設定画面へ戻る / 最大化切替 / フォルダ変更 / 終了"
+        help_text = "【操作方法】\n・Escキー: フルスクリーン切替\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 設定画面へ戻る / 最大化切替 / フォルダ変更 / 終了\n・操作パネル: 監視ON/OFF / 即時チェック (新規画像を手動で取り込む)"
         tk.Label(self.menu_frame, text=help_text, fg='#AAAAAA', bg='#333333', justify=tk.LEFT).pack(pady=10)
 
     def select_folder(self):
@@ -519,6 +563,30 @@ class ImageViewerApp:
             self.metadata_toggle_button.config(text="情報欄非表示")
         else:
             self.metadata_toggle_button.config(text="情報欄表示")
+
+    def update_polling_status_ui(self):
+        """監視 ON/OFF トグルボタンの表示を現在状態に合わせる"""
+        button = getattr(self, "polling_toggle_button", None)
+        if button is None:
+            return
+        if self.polling_enabled:
+            button.config(text="監視ON", bg='#4CAF50', fg='white')
+        else:
+            button.config(text="監視OFF", bg='#FF9800', fg='white')
+
+    def toggle_polling(self):
+        """再生中の監視 ON/OFF を切り替える"""
+        if not self.is_slideshow_active:
+            return
+        self.polling_enabled = not self.polling_enabled
+        # ON 復帰時は pending をリセットして、中断中の変化も含めて差分を取り直す。
+        # OFF 時は次回 poll 予約を解除するだけで folder_snapshot は据え置く。
+        self.pending_changes = {}
+        if self.polling_enabled:
+            self.start_polling()
+        else:
+            self.cancel_polling()
+        self.update_polling_status_ui()
 
     def request_render(self, *, layout=False, image=False, metadata=False, thumbnail_highlight=False):
         """必要な描画更新を1回に集約して予約"""
@@ -1017,11 +1085,6 @@ finally {{
             self.cancel_metadata_refresh()
         self.request_render(layout=True, metadata=True)
 
-    def clear_image_queue(self):
-        """未処理の監視イベントを破棄"""
-        while not self.image_queue.empty():
-            self.image_queue.get_nowait()
-
     def clear_thumbnail_widgets(self):
         """既存サムネイルUIを破棄"""
         self.cancel_thumbnail_follow()
@@ -1458,12 +1521,214 @@ finally {{
                 self.set_debug_hud_value("render_status", "idle")
             print(f"Error loading {image_path}: {e}")
 
-    def stop_observer(self):
-        """フォルダ監視を停止"""
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
+    def start_polling(self):
+        """ポーリングループを開始する (既存予約は破棄)"""
+        self.cancel_polling()
+        if not self.is_slideshow_active or not self.folder_path or not self.polling_enabled:
+            return
+        self.poll_after_id = self.root.after(self.poll_interval_ms, self.poll_folder)
+
+    def cancel_polling(self):
+        """次回ポーリング予約を破棄する"""
+        if self.poll_after_id is not None:
+            self.root.after_cancel(self.poll_after_id)
+            self.poll_after_id = None
+
+    def get_settle_seconds(self):
+        """confirm-twice 用の最低安定時間 (秒) を返す"""
+        ms = max(self.poll_interval_ms * POLL_SETTLE_MULTIPLIER, POLL_SETTLE_MIN_MS)
+        return ms / 1000.0
+
+    def resolve_stable_snapshot(self, current_snapshot, stat_failed):
+        """current_snapshot から「確定済みスナップショット」を計算して返す。
+
+        戻り値は「差分検出に使うべき、現時点で信頼できるスナップショット」。
+        確定済みの path はそのまま、書き込み途中 (pending) や一時的に消えている
+        path は前回確定値を持ち越す。完全新規 (前回確定値なし) は載せない。
+
+        - 既存スナップショットと完全一致 → そのまま確定済みとして残す
+        - 変化中 (pending) → pending_changes に積み、settle 秒数経過で新値を確定。
+          経過していなければ前回確定値を持ち越して「変化していない」扱いにする。
+        - 完全新規 (前回確定値なし) → 戻り値に載せず、pending_changes に積むだけ。
+          settle 経過後に初めて返り値へ載る。
+        - 確定済みなのに current_snapshot から消えた (atomic rename で書き換え中
+          のファイルが一瞬 listdir から見えなくなる等) → vanish-pending に積み、
+          settle 秒数連続で消え続けたら確定削除。それまでは前回値を持ち越して
+          チラつきを防ぐ。stat_failed は呼び出し側で別途持ち越されるのでここでは
+          除外する。
+        - 一度 pending に入ったものは観測値が変わるたび first_seen をリセット。
+
+        pending_changes の sentinel: 値=None は「vanish-pending」を意味する。
+        """
+        now = time.perf_counter()
+        settle_seconds = self.get_settle_seconds()
+
+        stable = {}
+        new_pending = {}
+
+        # 1. current_snapshot に居る path 群を処理 (確定 / 変化中 / 新規)
+        for path, value in current_snapshot.items():
+            previous_confirmed = self.folder_snapshot.get(path)
+            if previous_confirmed == value:
+                stable[path] = value
+                continue
+
+            pending_entry = self.pending_changes.get(path)
+            if pending_entry is not None and pending_entry[0] == value:
+                first_seen = pending_entry[1]
+                if now - first_seen >= settle_seconds:
+                    # settle 経過 → 新値で確定
+                    stable[path] = value
+                else:
+                    # まだ settle 中 → 前回確定値を持ち越して removed 扱いを防ぐ
+                    if previous_confirmed is not None:
+                        stable[path] = previous_confirmed
+                    new_pending[path] = (value, first_seen)
+            else:
+                # 初観測 or 値が変わったので first_seen を更新
+                if previous_confirmed is not None:
+                    stable[path] = previous_confirmed
+                new_pending[path] = (value, now)
+
+        # 2. 確定済みなのに current_snapshot から消えた path を処理 (vanish settle)
+        missing_paths = set(self.folder_snapshot) - set(current_snapshot) - set(stat_failed)
+        for path in missing_paths:
+            previous_confirmed = self.folder_snapshot[path]
+            pending_entry = self.pending_changes.get(path)
+            if pending_entry is not None and pending_entry[0] is None:
+                first_seen = pending_entry[1]
+                if now - first_seen >= settle_seconds:
+                    # settle 経過 → 確定削除 (stable に載せない)
+                    pass
+                else:
+                    # まだ settle 中 → 前回値を持ち越して removed 扱いを防ぐ
+                    stable[path] = previous_confirmed
+                    new_pending[path] = (None, first_seen)
+            else:
+                # 消失を初観測 (または直前まで別状態だった) → vanish-pending を開始
+                stable[path] = previous_confirmed
+                new_pending[path] = (None, now)
+
+        self.pending_changes = new_pending
+        return stable
+
+    def poll_folder(self):
+        """ポーリング 1 周期 (Tk メインスレッドで動作)"""
+        self.poll_after_id = None
+        try:
+            if not self.is_slideshow_active or not self.folder_path or not self.polling_enabled:
+                return
+            # 単発チェック中は auto poll が割り込まないようにスキップ。
+            # (manual の phase1 と phase2 の間に folder_snapshot を動かすと
+            #  phase2 の diff が壊れるため。)
+            if self.manual_check_after_id is not None:
+                return
+
+            try:
+                current_snapshot, stat_failed = scan_folder_snapshot(self.folder_path)
+            except OSError as exc:
+                # listdir 自体が失敗した場合は状態を変更せずに次の周期へ。
+                # (ネットワークドライブの瞬断などで、ここで削除扱いにすると混乱するため)
+                print(f"[poll] listdir failed for {self.folder_path}: {exc}")
+                return
+
+            stable_snapshot = self.resolve_stable_snapshot(current_snapshot, stat_failed)
+            added, removed, modified = diff_snapshots(self.folder_snapshot, stable_snapshot, stat_failed)
+
+            if added or removed or modified:
+                new_snapshot = dict(stable_snapshot)
+                # stat_failed のパスは前回の確定値があれば持ち越し (transient 失敗扱い)
+                for path in stat_failed:
+                    if path in self.folder_snapshot:
+                        new_snapshot[path] = self.folder_snapshot[path]
+                self.apply_folder_diff(added, removed, modified, new_snapshot=new_snapshot)
+        finally:
+            # 例外が出ても polling は止めない (finally で必ず再予約)
+            if self.is_slideshow_active and self.folder_path and self.polling_enabled:
+                self.poll_after_id = self.root.after(self.poll_interval_ms, self.poll_folder)
+
+    def request_manual_check(self):
+        """単発の更新チェック。
+
+        100ms 間隔で 2 回スキャンし、両方で (mtime_ns, size) が一致したものだけを
+        反映する。書き込み途中のファイルは弾く。"""
+        if not self.folder_path:
+            return
+        if self.manual_check_after_id is not None:
+            # 既に進行中なら多重起動しない
+            return
+
+        try:
+            first_snapshot, first_failed = scan_folder_snapshot(self.folder_path)
+        except OSError as exc:
+            print(f"[manual_check] listdir failed: {exc}")
+            return
+
+        self.manual_check_after_id = self.root.after(
+            MANUAL_CHECK_GAP_MS,
+            lambda: self._manual_check_phase2(first_snapshot, first_failed),
+        )
+
+    def _manual_check_phase2(self, first_snapshot, first_failed):
+        """単発チェックの 2 回目スキャンと差分反映"""
+        self.manual_check_after_id = None
+        if not self.folder_path:
+            return
+
+        try:
+            second_snapshot, second_failed = scan_folder_snapshot(self.folder_path)
+        except OSError as exc:
+            print(f"[manual_check] listdir failed (2nd pass): {exc}")
+            return
+
+        combined_failed = first_failed | second_failed
+        baseline = self.folder_snapshot  # auto poll は manual_check_after_id != None で抑止済み
+
+        # 両回で同じ (mtime_ns, size) になったものだけを「安定」として扱う。
+        # 値が phase1 と phase2 で異なる場合 (まだ書き込み中) や、phase2 で見えない
+        # 場合 (一瞬の rename gap) は、baseline に居れば baseline 値を持ち越す。
+        # これがないと、書き換え中ファイルや atomic rename 中の path が一旦 removed
+        # 扱いになって表示が揺れる。
+        stable_snapshot = {}
+        for path, value in second_snapshot.items():
+            if first_snapshot.get(path) == value:
+                stable_snapshot[path] = value
+            elif path in baseline:
+                # phase1 と phase2 で値不一致 → 書き込み中扱い、baseline を持ち越す
+                stable_snapshot[path] = baseline[path]
+            # else: 完全新規かつ不安定 → 載せない (確定するまで保留)
+
+        # baseline にあるが second_snapshot に居ない path をフォロー:
+        # - combined_failed: 持ち越し (transient stat 失敗)
+        # - first_snapshot には居て second_snapshot で消えた: atomic rename の
+        #   隙間 / 進行中の書き換えの可能性 → 持ち越し
+        # - 両 phase で listdir からも見えず stat_failed でもない: 確定削除
+        for path, baseline_value in baseline.items():
+            if path in stable_snapshot or path in second_snapshot:
+                continue
+            if path in combined_failed:
+                stable_snapshot[path] = baseline_value
+            elif path in first_snapshot:
+                # phase1 では見えたが phase2 で消えた → 隙間に当たった可能性。
+                # 両 phase 一致しないと removed 確定にしない (安全側)。
+                stable_snapshot[path] = baseline_value
+            # else: 両 phase で見えず、stat_failed でもない → 確定削除
+
+        added, removed, modified = diff_snapshots(
+            baseline,
+            stable_snapshot,
+            combined_failed,
+        )
+
+        if added or removed or modified:
+            new_snapshot = dict(stable_snapshot)
+            for path in combined_failed:
+                if path in baseline:
+                    new_snapshot[path] = baseline[path]
+            self.apply_folder_diff(added, removed, modified, new_snapshot=new_snapshot)
+
+        # auto poll 側の pending を更新しておくと、復帰直後の重複検知を抑えられる
+        self.pending_changes = {}
 
     def cancel_scheduled_image(self):
         """予約済みの自動送りを解除"""
@@ -1543,6 +1808,22 @@ finally {{
         )
         previous_count = len(self.image_list)
 
+        # current が削除された場合の fallback 候補を、削除前リストから path ベースで確保。
+        # current より前の要素も同時に削除されると単純な index 流用で 1 枚飛ぶ事故が起きるため、
+        # 「現在より後ろにあり、かつ removed でない最初の path」を覚えておく (= next 候補)。
+        # 見つからなければ「現在より前にあり、かつ removed でない最後の path」(= prev 候補) を採用。
+        next_candidate_path = None
+        prev_candidate_path = None
+        if current_path_before is not None and removed:
+            for path in self.image_list[self.current_index + 1:]:
+                if path not in removed:
+                    next_candidate_path = path
+                    break
+            for path in reversed(self.image_list[:self.current_index]):
+                if path not in removed:
+                    prev_candidate_path = path
+                    break
+
         # スナップショット更新
         if new_snapshot is not None:
             self.folder_snapshot = new_snapshot
@@ -1579,24 +1860,29 @@ finally {{
         self.image_list.sort(key=self.get_image_sort_key)
 
         # current_index を path ベースで再解決
-        # ルール: 元の current_path が今もあればその位置。無ければ (= 削除された)
-        # 同じ位置 (= 次の画像) を採用、超えていれば末尾 (= 前)、空なら -1。
+        # ルール: 元の current_path が今もあればその位置。
+        # 無い (= 削除された) なら next 候補 → prev 候補 → 空 の順で fallback。
+        # next/prev 候補は削除適用前に path で確保済みなので、複数同時削除があっても
+        # 「期待した次の画像」へ正しく辿り着ける。
         current_force_render = False
         if current_path_before is not None:
             resolved = find_path_index(self.image_list, current_path_before)
             if resolved >= 0:
                 self.current_index = resolved
             else:
-                if self.image_list:
-                    fallback = self.current_index if self.current_index >= 0 else 0
-                    if fallback < len(self.image_list):
-                        self.current_index = fallback
-                    else:
-                        self.current_index = len(self.image_list) - 1
-                    current_force_render = True
+                resolved_fallback = -1
+                if next_candidate_path is not None:
+                    resolved_fallback = find_path_index(self.image_list, next_candidate_path)
+                if resolved_fallback < 0 and prev_candidate_path is not None:
+                    resolved_fallback = find_path_index(self.image_list, prev_candidate_path)
+                if resolved_fallback >= 0:
+                    self.current_index = resolved_fallback
+                elif self.image_list:
+                    # next/prev 候補がいずれも無い (= 現在画像が唯一だった等) → 末尾を採用
+                    self.current_index = len(self.image_list) - 1
                 else:
                     self.current_index = -1
-                    current_force_render = True
+                current_force_render = True
 
         # シーク UI / サムネ帯
         self.update_seekbar_range()
@@ -1652,17 +1938,6 @@ finally {{
         self.image_list = list(snapshot.keys())
         self.sort_image_list()
 
-    def start_observer(self):
-        """フォルダ監視の開始"""
-        self.stop_observer()
-        self.clear_image_queue()
-        
-        if self.folder_path:
-            event_handler = NewImageHandler(self.image_queue)
-            self.observer = Observer()
-            self.observer.schedule(event_handler, self.folder_path, recursive=False)
-            self.observer.start()
-
     def set_fullscreen_state(self, enabled):
         """フルスクリーン状態を切り替える"""
         self.is_fullscreen = enabled
@@ -1672,10 +1947,12 @@ finally {{
     def refresh_current_folder(self):
         """現在の対象フォルダを読み直して監視対象も更新"""
         self.clear_current_image_cache()
+        self.cancel_polling()
+        self.pending_changes = {}
         self.load_images_from_folder()
         self.update_seekbar_range()
         self.refresh_thumbnail_strip()
-        self.start_observer()
+        self.start_polling()
         self.current_index = -1
 
         if self.image_list:
@@ -1719,6 +1996,20 @@ finally {{
             messagebox.showwarning("警告", f"秒数は {MIN_INTERVAL_SECONDS:.0f} 〜 {MAX_INTERVAL_SECONDS:.0f} の範囲で入力してください。")
             return
 
+        try:
+            poll_val = int(self.poll_interval_setting_var.get())
+            if poll_val < POLL_INTERVAL_MIN_MS or poll_val > POLL_INTERVAL_MAX_MS:
+                raise ValueError
+            self.poll_interval_ms = poll_val
+        except (ValueError, tk.TclError):
+            messagebox.showwarning(
+                "警告",
+                f"監視間隔は {POLL_INTERVAL_MIN_MS} 〜 {POLL_INTERVAL_MAX_MS} ms の範囲で指定してください。",
+            )
+            return
+        self.polling_enabled = bool(self.polling_enabled_setting_var.get())
+        self.update_polling_status_ui()
+
         self.sync_interval_ui()
         self.menu_frame.place_forget()  # メニューを隠す
         
@@ -1757,10 +2048,13 @@ finally {{
         
         # 自動再生のタイマーをキャンセル
         self.cancel_scheduled_image()
-        
-        # 監視も一時停止
-        self.stop_observer()
-        self.clear_image_queue()
+
+        # ポーリング監視も一時停止
+        self.cancel_polling()
+        self.pending_changes = {}
+        if self.manual_check_after_id is not None:
+            self.root.after_cancel(self.manual_check_after_id)
+            self.manual_check_after_id = None
         self.request_render(layout=True)
 
     def on_escape(self, event=None):
@@ -1903,25 +2197,12 @@ finally {{
             print("Pause")
             self.cancel_scheduled_image()
 
-    def check_queue(self):
-        """監視スレッドから送られてくる新しい画像の確認"""
-        added = set()
-        while not self.image_queue.empty():
-            new_image = self.image_queue.get()
-            if find_path_index(self.image_list, new_image) < 0:
-                added.add(new_image)
-
-        if added:
-            for path in added:
-                print(f"New image added: {path}")
-            self.apply_folder_diff(added=added, removed=set(), modified=set())
-
-        # 500ms後に再チェック
-        self.root.after(500, self.check_queue)
-
     def on_closing(self):
         """アプリ終了時の処理"""
-        self.stop_observer()
+        self.cancel_polling()
+        if self.manual_check_after_id is not None:
+            self.root.after_cancel(self.manual_check_after_id)
+            self.manual_check_after_id = None
         self.clear_current_image_cache()
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
