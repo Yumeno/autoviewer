@@ -48,6 +48,67 @@ IMAGE_OPEN_RETRY_DELAY_MS = 500
 IMAGE_OPEN_MAX_ATTEMPTS = 3
 METADATA_CACHE_MAX_ITEMS = 256
 
+
+def scan_folder_snapshot(folder_path):
+    """フォルダ直下を 1 回だけ scandir で走査してスナップショットを返す。
+
+    戻り値: (snapshot, stat_failed)
+        snapshot: {path: (mtime_ns, size)} stat に成功した画像
+        stat_failed: listdir には見えるが stat に失敗したパス集合
+                     呼び出し側は「削除扱いしない / スナップショットは前回値を保つ」と
+                     解釈する。
+
+    listdir 自体が失敗した場合は OSError を素通しする。呼び出し側は
+    「この poll サイクルをスキップ」と解釈し、状態は一切変更しない。
+    """
+    snapshot = {}
+    stat_failed = set()
+    with os.scandir(folder_path) as it:
+        for entry in it:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                stat_failed.add(entry.path)
+                continue
+            ext = os.path.splitext(entry.name)[1].lower()
+            if ext not in SUPPORTED_EXTS:
+                continue
+            try:
+                stat_result = entry.stat()
+                snapshot[entry.path] = (stat_result.st_mtime_ns, stat_result.st_size)
+            except OSError:
+                stat_failed.add(entry.path)
+    return snapshot, stat_failed
+
+
+def diff_snapshots(prev, current, stat_failed):
+    """前回・今回のスナップショットから (added, removed, modified) を計算する。
+
+    - added:    current にあって prev に無いパス
+    - removed:  prev にあって current にも stat_failed にも無いパス
+                (listdir が成功した上で見えなくなった = 確定削除)
+    - modified: 両方にあって (mtime_ns, size) が異なるパス
+    """
+    prev_keys = set(prev)
+    current_keys = set(current)
+    added = current_keys - prev_keys
+    removed = prev_keys - current_keys - stat_failed
+    modified = {p for p in prev_keys & current_keys if prev[p] != current[p]}
+    return added, removed, modified
+
+
+def find_path_index(image_list, path):
+    """normcase 正規化込みで image_list 内の path のインデックスを返す。無ければ -1。"""
+    if path is None:
+        return -1
+    target = os.path.normcase(os.path.normpath(path))
+    for i, p in enumerate(image_list):
+        if os.path.normcase(os.path.normpath(p)) == target:
+            return i
+    return -1
+
+
 class NewImageHandler(FileSystemEventHandler):
     """フォルダに新しいファイルが追加されたことを検知するハンドラ"""
     def __init__(self, image_queue):
@@ -132,6 +193,7 @@ class ImageViewerApp:
         # 監視用
         self.observer = None
         self.image_queue = queue.Queue()
+        self.folder_snapshot = {}  # {path: (mtime_ns, size)} 差分検出の基準
 
         # UI要素の構築
         self.setup_ui()
@@ -1421,11 +1483,19 @@ finally {{
             self.after_id = self.root.after(next_delay, self.next_image)
 
     def get_image_sort_key(self, image_path):
-        """更新日時を基準に時系列ソートするためのキー"""
-        try:
-            timestamp = os.path.getmtime(image_path)
-        except OSError:
-            timestamp = float('inf')
+        """更新日時を基準に時系列ソートするためのキー
+
+        スナップショットがあればそこから mtime_ns を引き、無ければ stat する。
+        ソートは「初回ロード時にスキャンで得た値」と「ポーリングで得た値」を
+        どちらも同じルールで扱えるようにここで吸収する。"""
+        snapshot_entry = self.folder_snapshot.get(image_path)
+        if snapshot_entry is not None:
+            timestamp = snapshot_entry[0]  # mtime_ns
+        else:
+            try:
+                timestamp = os.stat(image_path).st_mtime_ns
+            except OSError:
+                timestamp = float('inf')
 
         normalized_path = os.path.normcase(os.path.normpath(image_path))
         return (timestamp, normalized_path)
@@ -1447,16 +1517,139 @@ finally {{
                     self.seekbar_var.set(index + 1)
                 break
 
+    def apply_folder_diff(self, added, removed, modified, new_snapshot=None):
+        """検出済みのフォルダ差分を image_list と UI に反映する。
+
+        - added/removed/modified: 個々のパス集合 (string set)
+        - new_snapshot: ポーリングで取得したスナップショット全体。
+                        渡された場合は folder_snapshot をこれで置き換える。
+                        渡されない場合 (watchdog 経由など) は追加パスのみ stat して
+                        folder_snapshot に追記する。
+
+        差分の発生源 (watchdog/poll) によらず、ソート・current 再解決・サムネ更新・
+        待機再開を一箇所で扱うために存在する。"""
+        if not (added or removed or modified):
+            if new_snapshot is not None:
+                self.folder_snapshot = new_snapshot
+            return
+
+        # 差分適用前の current_path と「末尾待機中だったか」を覚えておく
+        current_path_before = None
+        if 0 <= self.current_index < len(self.image_list):
+            current_path_before = self.image_list[self.current_index]
+        was_at_end = (
+            self.current_index == -1
+            or self.current_index == len(self.image_list) - 1
+        )
+        previous_count = len(self.image_list)
+
+        # スナップショット更新
+        if new_snapshot is not None:
+            self.folder_snapshot = new_snapshot
+        else:
+            for path in added:
+                try:
+                    st = os.stat(path)
+                    self.folder_snapshot[path] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+
+        # 削除を反映
+        for path in removed:
+            if path in self.image_list:
+                self.image_list.remove(path)
+            self.folder_snapshot.pop(path, None)
+            self.metadata_cache.pop(path, None)
+
+        # 追加を反映
+        for path in added:
+            if find_path_index(self.image_list, path) < 0:
+                self.image_list.append(path)
+            self.metadata_cache.pop(path, None)
+
+        # 上書きを反映 (image_list そのものは不変)
+        current_image_replaced = False
+        for path in modified:
+            self.metadata_cache.pop(path, None)
+            if path == self.current_source_path:
+                self.clear_current_image_cache()
+                current_image_replaced = True
+
+        # ソート (スナップショットから mtime を引くので再 stat されない)
+        self.image_list.sort(key=self.get_image_sort_key)
+
+        # current_index を path ベースで再解決
+        # ルール: 元の current_path が今もあればその位置。無ければ (= 削除された)
+        # 同じ位置 (= 次の画像) を採用、超えていれば末尾 (= 前)、空なら -1。
+        current_force_render = False
+        if current_path_before is not None:
+            resolved = find_path_index(self.image_list, current_path_before)
+            if resolved >= 0:
+                self.current_index = resolved
+            else:
+                if self.image_list:
+                    fallback = self.current_index if self.current_index >= 0 else 0
+                    if fallback < len(self.image_list):
+                        self.current_index = fallback
+                    else:
+                        self.current_index = len(self.image_list) - 1
+                    current_force_render = True
+                else:
+                    self.current_index = -1
+                    current_force_render = True
+
+        # シーク UI / サムネ帯
+        self.update_seekbar_range()
+        only_appended_at_end = (
+            bool(added)
+            and not removed
+            and not modified
+            and len(self.image_list) == previous_count + len(added)
+        )
+        if only_appended_at_end:
+            for path in added:
+                idx = find_path_index(self.image_list, path)
+                if idx == len(self.image_list) - 1:
+                    self.append_thumbnail_item(path)
+                else:
+                    # 中間に入った追加が混ざる場合は安全側で再構築
+                    only_appended_at_end = False
+                    break
+        if not only_appended_at_end:
+            self.refresh_thumbnail_strip()
+
+        # 再描画要求は現在画像が差し替わった / 消えた場合のみ。
+        # 単純な追加だけの場合はサムネ追加・seekbar 更新で必要な反映は完了している。
+        needs_image_render = current_image_replaced or current_force_render
+        if needs_image_render:
+            self.request_render(
+                image=True,
+                metadata=self.metadata_visible,
+                thumbnail_highlight=self.thumbnail_visible,
+            )
+
+        # 末尾待機からの即時再開 (追加があったときのみ評価する)
+        # 古い実装と同じく、ファイル書き込み完了を待つため 500ms 後に進める。
+        # (commit 3 で confirm-twice 導入後は不要だが、watchdog 経由のままなので維持)
+        if added and self.is_slideshow_active and self.is_playing and was_at_end:
+            if self.current_index == -1 or self.current_index < len(self.image_list) - 1:
+                self.schedule_next_image(delay_ms=500)
+
     def load_images_from_folder(self):
+        """対象フォルダをスキャンして image_list と folder_snapshot を構築する。"""
         self.image_list = []
+        self.folder_snapshot = {}
         if not self.folder_path:
             return
 
-        for file in os.listdir(self.folder_path):
-            ext = os.path.splitext(file)[1].lower()
-            if ext in SUPPORTED_EXTS:
-                self.image_list.append(os.path.join(self.folder_path, file))
+        try:
+            snapshot, _stat_failed = scan_folder_snapshot(self.folder_path)
+        except OSError as exc:
+            print(f"Failed to scan folder {self.folder_path}: {exc}")
+            return
 
+        self.folder_snapshot = snapshot
+        self.image_list = list(snapshot.keys())
         self.sort_image_list()
 
     def start_observer(self):
@@ -1712,36 +1905,16 @@ finally {{
 
     def check_queue(self):
         """監視スレッドから送られてくる新しい画像の確認"""
+        added = set()
         while not self.image_queue.empty():
             new_image = self.image_queue.get()
-            # Windowsのパスの大文字小文字などのゆれを吸収するために正規化して比較
-            norm_new = os.path.normcase(os.path.normpath(new_image))
-            norm_existing = [os.path.normcase(os.path.normpath(p)) for p in self.image_list]
-            
-            if norm_new not in norm_existing:
-                current_path = None
-                if 0 <= self.current_index < len(self.image_list):
-                    current_path = self.image_list[self.current_index]
-                should_resume_from_wait = self.current_index == -1 or self.current_index == len(self.image_list) - 1
-                previous_count = len(self.image_list)
+            if find_path_index(self.image_list, new_image) < 0:
+                added.add(new_image)
 
-                self.image_list.append(new_image)
-                self.sort_image_list(current_path=current_path)
-                print(f"New image added: {new_image}")
-                self.update_seekbar_range()
-                new_index = self.image_list.index(new_image)
-                appended_at_end = previous_count == len(self.image_list) - 1 and new_index == len(self.image_list) - 1
-                if appended_at_end:
-                    self.append_thumbnail_item(new_image)
-                else:
-                    self.refresh_thumbnail_strip()
-                self.metadata_cache.pop(new_image, None)
-                
-                # もし現在最後の画像を表示中で待機状態だったなら、すぐ新しい画像へ進む
-                if self.is_slideshow_active and self.is_playing and should_resume_from_wait:
-                    if self.current_index == -1 or self.current_index < len(self.image_list) - 1:
-                        # 500ms待ってから表示（ファイルの書き込み完了を待つため）
-                        self.schedule_next_image(delay_ms=500)
+        if added:
+            for path in added:
+                print(f"New image added: {path}")
+            self.apply_folder_diff(added=added, removed=set(), modified=set())
 
         # 500ms後に再チェック
         self.root.after(500, self.check_queue)
