@@ -21,3 +21,6 @@ CLAUDE.md
 debug-timeline.log
 resize-debug.log
 WORKLOG.local.md
+
+# git worktrees (in-repo developer trees)
+worktrees/
