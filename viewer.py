@@ -2193,6 +2193,11 @@ finally {{
             if self.is_slideshow_active:
                 messagebox.showinfo("情報", "選択したフォルダに画像が見つかりませんでしたが、待機モードに入ります。\n画像が追加されると表示されます。")
 
+        # current_index がここで初めて確定するので、ファイル操作ボタンの enable
+        # 状態を改めて評価する。start_slideshow から呼ばれた直後はまだ -1 で、
+        # この時点で初めて 0 (or 引き続き -1) に決まる。
+        self.update_delete_button_state()
+
     def change_folder_during_slideshow(self):
         """再生中に対象フォルダを切り替える"""
         if not self.is_slideshow_active:
