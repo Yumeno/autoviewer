@@ -150,6 +150,9 @@ python viewer.py --debug resize,timeline,hud
 
 ## **更新履歴**
 
+* **v1.9**  
+  * 【機能追加】再生中の操作パネルに「削除」ボタンを追加。一時停止中のみ有効で、確認ダイアログで「はい」を選ぶと表示中の画像を OS のゴミ箱へ移動します。誤削除防止のため、自動送り中は押せません。
+  * 削除は Windows (`SHFileOperationW`) / macOS (`osascript` + Finder) / Linux (`gio trash` または `trash-cli`) のゴミ箱機構を使用するので、誤って消しても OS の機能で復元できます。Linux で `gio` も `trash-cli` も無い環境では、その旨のエラーが出ます。
 * **v1.8**  
   * 【改善】フォルダ監視を `watchdog` ベースのイベント駆動から、ポーリング差分方式に置き換え。Stable Diffusion WebUI (reForge neo 等) の保存パターンで取りこぼしていた新着画像を確実に拾えるようにしました。  
   * 【機能追加】設定画面に「自動監視を有効にする」チェックと「監視間隔 (ms)」入力欄を追加。デフォルトは 250ms、範囲 100〜5000ms。  

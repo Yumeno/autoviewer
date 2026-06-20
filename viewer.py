@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -115,6 +116,127 @@ def find_path_index(image_list, path):
         if os.path.normcase(os.path.normpath(p)) == target:
             return i
     return -1
+
+
+def move_to_trash(path):
+    """指定ファイルを OS のゴミ箱へ移動する (cross-platform)。
+
+    Windows: ctypes 経由で SHFileOperationW を呼ぶ
+    macOS:   osascript で Finder の delete を呼び出す
+    Linux:   gio trash → trash (trash-cli) の順でフォールバック
+
+    失敗時は OSError を raise する。
+    """
+    abs_path = os.path.abspath(path)
+    if sys.platform.startswith("win"):
+        _trash_windows(abs_path)
+    elif sys.platform == "darwin":
+        _trash_macos(abs_path)
+    elif sys.platform.startswith("linux"):
+        _trash_linux(abs_path)
+    else:
+        raise OSError(f"ゴミ箱への移動はこの OS では未対応です: {sys.platform}")
+
+
+def _trash_windows(abs_path):
+    """Windows: SHFileOperationW(FO_DELETE, FOF_ALLOWUNDO) でゴミ箱へ送る"""
+    import ctypes
+    from ctypes import wintypes
+
+    FO_DELETE = 3
+    FOF_ALLOWUNDO = 0x40
+    FOF_NOCONFIRMATION = 0x10
+    FOF_SILENT = 0x04
+    FOF_NOERRORUI = 0x400
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        # pFrom / pTo は LPCWSTR ではなく c_void_p にする。
+        # LPCWSTR (c_wchar_p) は ctypes が \0 で文字列を打ち切るため、
+        # SHFileOperationW が要求する「ダブル \0 終端」を渡せない。
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", ctypes.c_void_p),
+            ("pTo", ctypes.c_void_p),
+            ("fFlags", ctypes.c_ushort),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    # ファイル一覧 "path1\0path2\0...\0" + 末尾 \0 (リスト終端)。
+    # create_unicode_buffer が末尾 \0 を 1 個自動付与するので、こちらでも \0 を付けて
+    # 「path\0\0」になるようにする。GC されないよう参照を保持する。
+    buf = ctypes.create_unicode_buffer(abs_path + "\0")
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(buf, ctypes.c_void_p).value
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+
+    func = ctypes.windll.shell32.SHFileOperationW
+    func.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
+    func.restype = ctypes.c_int
+
+    result = func(ctypes.byref(op))
+    if result != 0:
+        raise OSError(f"SHFileOperationW failed: code 0x{result:X}")
+    if op.fAnyOperationsAborted:
+        raise OSError("ゴミ箱への移動が中断されました。")
+
+
+def _trash_macos(abs_path):
+    """macOS: osascript で Finder の delete を呼び出す。
+
+    パスは AppleScript 文字列に埋め込まず argv 経由で渡すので、改行や
+    特殊文字を含むパスでも壊れない。"""
+    script = (
+        "on run argv\n"
+        "    tell application \"Finder\" to delete POSIX file (item 1 of argv)\n"
+        "end run\n"
+    )
+    completed = subprocess.run(
+        ["osascript", "-e", script, abs_path],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise OSError(
+            "osascript によるゴミ箱移動が失敗しました: "
+            f"{completed.stderr.strip() or completed.stdout.strip() or 'unknown error'}"
+        )
+
+
+def _trash_linux(abs_path):
+    """Linux: gio trash → trash-put → trash の順で試行 (失敗もフォールバック)"""
+    # 各コマンドを順に試し、見つかって 0 で返したら成功。
+    # 見つかって失敗したものはエラーを集めておき、全滅したらまとめて報告する。
+    attempts = []
+    for cmd in ("gio", "trash-put", "trash"):
+        if not shutil.which(cmd):
+            continue
+        if cmd == "gio":
+            argv = ["gio", "trash", "--", abs_path]
+        else:
+            argv = [cmd, "--", abs_path]
+        completed = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode == 0:
+            return
+        err = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        attempts.append(f"{cmd}: {err}")
+
+    if attempts:
+        raise OSError(
+            "ゴミ箱への移動に失敗しました。\n" + "\n".join(attempts)
+        )
+    raise OSError(
+        "ゴミ箱への移動には 'gio' または 'trash-cli' のインストールが必要です。"
+    )
 
 
 class ImageViewerApp:
@@ -429,7 +551,20 @@ class ImageViewerApp:
             width=12,
             command=self.request_manual_check,
         )
-        self.manual_check_button.pack(side=tk.LEFT)
+        self.manual_check_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        # 削除ボタン: 一時停止中のみ enable。常に確認ダイアログを出してから削除する。
+        self.delete_button = tk.Button(
+            secondary_controls,
+            text="削除",
+            width=8,
+            command=self.delete_current_image,
+            bg='#C62828',
+            fg='white',
+            disabledforeground='#777777',
+            state=tk.DISABLED,
+        )
+        self.delete_button.pack(side=tk.LEFT)
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(
@@ -587,6 +722,64 @@ class ImageViewerApp:
         else:
             self.cancel_polling()
         self.update_polling_status_ui()
+
+    def update_delete_button_state(self):
+        """削除ボタンの enable / disable を現在状態に合わせる。
+
+        有効条件:
+        - スライドショー実行中
+        - 一時停止中 (is_playing == False)
+        - 現在表示中の画像がある
+        いずれか欠けたら disable。"""
+        button = getattr(self, "delete_button", None)
+        if button is None:
+            return
+        enabled = (
+            self.is_slideshow_active
+            and not self.is_playing
+            and self.get_current_image_path() is not None
+        )
+        button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def delete_current_image(self):
+        """現在表示中の画像をゴミ箱へ送る (確認ダイアログ付き)。
+
+        二重ガード:
+        - スライドショー中・一時停止中・現在画像あり、の 3 条件成立時のみ実行
+        - messagebox.askyesno で明示的に「はい」を選んだ場合のみ削除
+        """
+        if not self.is_slideshow_active or self.is_playing:
+            return
+        image_path = self.get_current_image_path()
+        if not image_path:
+            return
+
+        confirmed = messagebox.askyesno(
+            "削除確認",
+            (
+                "以下の画像をゴミ箱へ移動しますか？\n\n"
+                f"ファイル: {os.path.basename(image_path)}\n"
+                f"パス: {image_path}"
+            ),
+            default=messagebox.NO,
+        )
+        if not confirmed:
+            return
+
+        try:
+            move_to_trash(image_path)
+        except Exception as exc:
+            messagebox.showerror(
+                "削除エラー",
+                f"画像をゴミ箱へ移動できませんでした。\n\n{exc}",
+            )
+            return
+
+        # 即座に image_list / folder_snapshot から外して UI を進める。
+        # ポーリングが次のサイクルでこの削除を検知しても、folder_snapshot に
+        # 既に居ないので二重発火しない。
+        self.apply_folder_diff(added=set(), removed={image_path}, modified=set())
+        self.update_delete_button_state()
 
     def request_render(self, *, layout=False, image=False, metadata=False, thumbnail_highlight=False):
         """必要な描画更新を1回に集約して予約"""
@@ -1921,6 +2114,9 @@ finally {{
             if self.current_index == -1 or self.current_index < len(self.image_list) - 1:
                 self.schedule_next_image(delay_ms=500)
 
+        # 削除ボタンの enable 条件 (現在画像の有無) が変わるので追従させる
+        self.update_delete_button_state()
+
     def load_images_from_folder(self):
         """対象フォルダをスキャンして image_list と folder_snapshot を構築する。"""
         self.image_list = []
@@ -2017,6 +2213,7 @@ finally {{
         self.current_index = -1
         self.is_playing = True
         self.update_play_pause_button()
+        self.update_delete_button_state()
         self.set_fullscreen_state(True)
         self.request_render(layout=True)
         self.refresh_current_folder()
@@ -2055,6 +2252,7 @@ finally {{
         if self.manual_check_after_id is not None:
             self.root.after_cancel(self.manual_check_after_id)
             self.manual_check_after_id = None
+        self.update_delete_button_state()
         self.request_render(layout=True)
 
     def on_escape(self, event=None):
@@ -2187,9 +2385,10 @@ finally {{
         """再生/一時停止の切り替え"""
         if not self.is_slideshow_active:
             return
-            
+
         self.is_playing = not self.is_playing
         self.update_play_pause_button()
+        self.update_delete_button_state()
         if self.is_playing:
             print("Play")
             self.schedule_next_image()
