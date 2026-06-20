@@ -2703,11 +2703,40 @@ finally {{
 
     def on_release(self, event):
         """マウス/タッチのリリース（スワイプ・タップ・ダブルタップ判定）"""
-        # ズーム中のドラッグ pan は on_pan_drag_motion で逐次反映済み。
-        # 終了処理だけして、タップ/スワイプ判定はスキップする。
+        # ズーム中はドラッグの開始/終了が pan として処理されるが、移動量がごく
+        # 小さい (= 実質タップ) ならダブルタップ判定にフォールバックする。
+        # これが無いと「ズーム中はダブルタップが届かず、2x から先に進めない」
+        # 事態になる (= 旧バグ)。
         if self.pan_drag_active:
+            start_mx, start_my, start_px, start_py = self.pan_drag_start or (
+                event.x,
+                event.y,
+                self.pan_offset_x,
+                self.pan_offset_y,
+            )
             self.pan_drag_active = False
             self.pan_drag_start = None
+            moved = abs(event.x - start_mx) + abs(event.y - start_my)
+            if moved > DOUBLE_TAP_DISTANCE_PX:
+                # 実際の pan として確定。pan_offset は on_pan_drag_motion 中に
+                # 更新済み。pan が変化したので double-tap 追跡もリセットしておく。
+                self._reset_double_tap_tracker()
+                return
+            # 小さい移動 = タップ扱い。pan 中に若干 pan_offset がずれている
+            # 可能性があるので、押下開始時の値へ巻き戻す。
+            if self.pan_offset_x != start_px or self.pan_offset_y != start_py:
+                self.pan_offset_x = start_px
+                self.pan_offset_y = start_py
+                self.request_render(image=True)
+            # ダブルタップ判定。zoom_level の更新は _double_tap_cycle_zoom 経由で
+            # set_zoom_level が呼ばれるので render は coalesce される。
+            if self._is_double_tap_continuation(event):
+                self._reset_double_tap_tracker()
+                self._double_tap_cycle_zoom(event.x, event.y)
+            else:
+                # 次のタップが double-tap になる可能性があるので追跡開始
+                self.last_tap_time_ms = event.time
+                self.last_tap_pos = (event.x, event.y)
             return
 
         if self.start_x is None:
