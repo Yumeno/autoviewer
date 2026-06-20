@@ -31,6 +31,15 @@ ZOOM_MIN = 1.0
 ZOOM_MAX = 5.0
 ZOOM_STEP_SLIDER = 0.1
 ZOOM_STEP_WHEEL = 0.25
+# ダブルタップでサイクルするズーム倍率 (この値群を 1.0x→2.0x→4.0x→1.0x の順に巡回)
+DOUBLE_TAP_ZOOM_LEVELS = (1.0, 2.0, 4.0)
+# 単一タップとダブルタップの区別に使う待ち時間 (ms)。
+# 単一タップ動作はこの間隔だけ遅延予約され、その間に 2 タップ目が来れば
+# 予約はキャンセルされてダブルタップ動作 (zoom cycle) に切り替わる。
+DOUBLE_TAP_THRESHOLD_MS = 300
+# ダブルタップとして連続認定する 2 タップ間の許容距離 (px)。
+# これを超えて離れた位置の連打は別々の単一タップとして扱う。
+DOUBLE_TAP_DISTANCE_PX = 30
 
 # Development-only debug switches.
 # Example:
@@ -124,31 +133,49 @@ def find_path_index(image_list, path):
     return -1
 
 
-def compute_zoom_crop(source_size, fit_size, zoom, pan_x, pan_y):
-    """ズーム + パンを反映した「source 側のクロップ範囲」を求める。
+def compute_zoom_crop(source_size, fit_size, viewport_size, zoom, pan_x, pan_y):
+    """ズーム + パンを反映した「source 側のクロップ範囲」と「描画先サイズ」を求める。
 
     pan_x / pan_y は **viewport (fit) ピクセル座標** での「中央からの平行移動量」。
-    返り値の pan_x_clamped / pan_y_clamped は viewport 端を超えないようにクランプされ
-    たもの。呼び出し側は受け取ったクランプ済み値で state を更新すること。
+    返り値の pan_x_clamped / pan_y_clamped は端を超えないようにクランプ済み。
 
-    zoom <= 1.0 の場合: source 全体をクロップ範囲とし、pan は 0 に強制 (フィット表示)。
-    zoom > 1.0 の場合: 中央から (source / zoom) サイズを切り出し、pan ぶんずらす。
+    zoom = 1.0 ではフィット表示 (画像サイズと viewport が違えば黒ぶちが残る)。
+    zoom > 1.0 では「拡大したぶん、これまで黒ぶちだった領域も使い切る」挙動にする。
+    具体的には表示サイズ = min(viewport, scaled) として、空いている軸方向で描画領域
+    を広げる。これによりズーム時に上下 / 左右の黒ぶちが消える。
+
+    返り値:
+        (crop_box, render_size, pan_x_clamped, pan_y_clamped)
+        crop_box: PIL crop 用 (left, top, right, bottom) (source 座標系)
+        render_size: cropped image を resize する先のピクセルサイズ
+                    (zoom <= 1.0 では fit_size、zoom > 1.0 では viewport 寄りに広がる)
     """
     source_w, source_h = source_size
     fit_w, fit_h = fit_size
+    viewport_w, viewport_h = viewport_size
 
     if zoom <= 1.0 or source_w <= 0 or source_h <= 0 or fit_w <= 0 or fit_h <= 0:
-        return (0, 0, source_w, source_h), 0.0, 0.0
+        return (0, 0, source_w, source_h), fit_size, 0.0, 0.0
 
-    max_pan_x = fit_w * (zoom - 1) / 2
-    max_pan_y = fit_h * (zoom - 1) / 2
+    scaled_w = fit_w * zoom
+    scaled_h = fit_h * zoom
+
+    # ズーム時の表示領域: viewport いっぱい使うが scaled を超えない。
+    # これにより、ズーム前は黒ぶちだった軸方向にも画像表示が広がっていく。
+    visible_w = max(1.0, min(viewport_w, scaled_w))
+    visible_h = max(1.0, min(viewport_h, scaled_h))
+
+    # pan の可動域 (表示領域が scaled 内をどこまでスライドできるか)
+    max_pan_x = max(0.0, (scaled_w - visible_w) / 2)
+    max_pan_y = max(0.0, (scaled_h - visible_h) / 2)
     pan_x = max(-max_pan_x, min(max_pan_x, pan_x))
     pan_y = max(-max_pan_y, min(max_pan_y, pan_y))
 
-    crop_w = source_w / zoom
-    crop_h = source_h / zoom
-    px_src = pan_x * source_w / (fit_w * zoom)
-    py_src = pan_y * source_h / (fit_h * zoom)
+    # source 側でのクロップサイズ / オフセット
+    crop_w = source_w * visible_w / scaled_w
+    crop_h = source_h * visible_h / scaled_h
+    px_src = pan_x * source_w / scaled_w
+    py_src = pan_y * source_h / scaled_h
 
     crop_left = (source_w / 2) + px_src - (crop_w / 2)
     crop_top = (source_h / 2) + py_src - (crop_h / 2)
@@ -163,7 +190,8 @@ def compute_zoom_crop(source_size, fit_size, zoom, pan_x, pan_y):
     crop_right = max(crop_left + 1, min(source_w, int(round(crop_right))))
     crop_bottom = max(crop_top + 1, min(source_h, int(round(crop_bottom))))
 
-    return (crop_left, crop_top, crop_right, crop_bottom), pan_x, pan_y
+    render_size = (max(1, int(round(visible_w))), max(1, int(round(visible_h))))
+    return (crop_left, crop_top, crop_right, crop_bottom), render_size, pan_x, pan_y
 
 
 def move_to_trash(path):
@@ -326,6 +354,15 @@ class ImageViewerApp:
         # ドラッグによるパン操作の途中状態
         self.pan_drag_active = False
         self.pan_drag_start = None  # (mouse_x, mouse_y, pan_x_start, pan_y_start)
+
+        # 単一タップとダブルタップ区別用 (1x 表示時の単一タップを後追い実行する仕組み)
+        self.pending_single_tap_id = None  # after() 予約 ID
+        self.pending_single_tap_event = None  # 遅延実行する単一タップのイベント情報
+        # ダブルタップ検出用に「直前のタップ release 時刻 + 位置」を保持する。
+        # Tk の <Double-Button-1> は第 2 タップの押下時に発火するため「タップ + 即スワイプ」
+        # の swipe を取りこぼす。代わりに release 時刻ベースで自前検出する。
+        self.last_tap_time_ms = None  # event.time (ms)
+        self.last_tap_pos = None  # (event.x, event.y)
 
         self.metadata_panel_visible = False
         self.metadata_text_value = None
@@ -908,7 +945,12 @@ class ImageViewerApp:
     def _apply_anchored_zoom(self, new_zoom, anchor_x, anchor_y):
         """マウス位置を軸にズームし、anchor 位置が画面上で動かないように pan 更新。
 
-        anchor_x / anchor_y は image_area 座標系 (px)。fit 表示領域の外なら無視。
+        anchor_x / anchor_y は image_area 座標系 (px)。表示領域 (visible) の外なら
+        中央軸扱いに倒す。
+
+        新ズームモデル (黒ぶち解消) に対応: zoom > 1.0 では表示領域 (visible) が
+        min(viewport, scaled) になるため、anchor の解釈と pan 再計算は visible
+        基準で行う。
         """
         if self.current_source_image is None:
             self.zoom_level = new_zoom
@@ -927,37 +969,69 @@ class ImageViewerApp:
             self.zoom_level = new_zoom
             return
 
-        # image_label 内で fit 画像は中央に置かれる。anchor を fit 座標系へ変換。
-        # image_label は image_area いっぱい (fill=BOTH expand=True) なので、
-        # image_area 座標 ≒ image_label 座標として扱える。
-        fit_origin_x = (viewport_w - fit_w) / 2
-        fit_origin_y = (viewport_h - fit_h) / 2
-        fit_anchor_x = anchor_x - fit_origin_x
-        fit_anchor_y = anchor_y - fit_origin_y
-
-        # fit 画像の外でクリックされた場合は中央 (fit_w/2, fit_h/2) を anchor として
-        # 中央軸ズームに流す。「pan 据え置きでズーム値だけ変える」と画像中心が
-        # 微妙に動くのでここで意図的に中央を保持する。
-        if not (0 <= fit_anchor_x <= fit_w and 0 <= fit_anchor_y <= fit_h):
-            fit_anchor_x = fit_w / 2
-            fit_anchor_y = fit_h / 2
-
         z_old = self.zoom_level
         z_new = new_zoom
 
-        # 旧 viewport (= fit) 内での anchor 位置を、画像の正規化座標へ
-        # 旧 scaled 座標系での anchor 位置
-        scaled_anchor_old_x = fit_w * (z_old - 1) / 2 + self.pan_offset_x + fit_anchor_x
-        scaled_anchor_old_y = fit_h * (z_old - 1) / 2 + self.pan_offset_y + fit_anchor_y
-        # 0..1 の正規化座標
-        frac_x = scaled_anchor_old_x / (fit_w * z_old)
-        frac_y = scaled_anchor_old_y / (fit_h * z_old)
+        # 旧 / 新 zoom 時点の表示領域 (visible) サイズ
+        scaled_old_w = max(1.0, fit_w * z_old)
+        scaled_old_h = max(1.0, fit_h * z_old)
+        scaled_new_w = max(1.0, fit_w * z_new)
+        scaled_new_h = max(1.0, fit_h * z_new)
+        visible_old_w = min(viewport_w, scaled_old_w)
+        visible_old_h = min(viewport_h, scaled_old_h)
+        visible_new_w = min(viewport_w, scaled_new_w)
+        visible_new_h = min(viewport_h, scaled_new_h)
+        if visible_old_w <= 0 or visible_old_h <= 0:
+            self.zoom_level = new_zoom
+            return
 
-        # 新 scaled 座標系で同じ画像位置を anchor として再計算
-        scaled_anchor_new_x = frac_x * fit_w * z_new
-        scaled_anchor_new_y = frac_y * fit_h * z_new
-        new_pan_x = scaled_anchor_new_x - fit_anchor_x - fit_w * (z_new - 1) / 2
-        new_pan_y = scaled_anchor_new_y - fit_anchor_y - fit_h * (z_new - 1) / 2
+        # image_area 内で visible は中央に配置される。anchor を visible 座標系へ。
+        visible_origin_old_x = (viewport_w - visible_old_w) / 2
+        visible_origin_old_y = (viewport_h - visible_old_h) / 2
+        visible_anchor_old_x = anchor_x - visible_origin_old_x
+        visible_anchor_old_y = anchor_y - visible_origin_old_y
+
+        # 表示領域の外 (黒ぶち位置 / 領域外) でのアクションは中央軸ズームへ。
+        # 「pan 据え置きでズーム値だけ変える」と画像中心が微妙に動くのでここで
+        # 意図的に中央を保持する。
+        if not (
+            0 <= visible_anchor_old_x <= visible_old_w
+            and 0 <= visible_anchor_old_y <= visible_old_h
+        ):
+            visible_anchor_old_x = visible_old_w / 2
+            visible_anchor_old_y = visible_old_h / 2
+
+        # 旧 scaled 座標系での anchor 位置
+        # viewport 中心 = scaled 中心 + pan_offset
+        # visible top-left in scaled = viewport_center - visible_size/2
+        vp_tl_old_x = scaled_old_w / 2 + self.pan_offset_x - visible_old_w / 2
+        vp_tl_old_y = scaled_old_h / 2 + self.pan_offset_y - visible_old_h / 2
+        scaled_anchor_old_x = vp_tl_old_x + visible_anchor_old_x
+        scaled_anchor_old_y = vp_tl_old_y + visible_anchor_old_y
+
+        # 画像内正規化座標 (0..1)
+        frac_x = scaled_anchor_old_x / scaled_old_w
+        frac_y = scaled_anchor_old_y / scaled_old_h
+
+        # 新 zoom での anchor の visible 座標系位置 (visible サイズが変わるので
+        # image_area 上の anchor 位置が変わらないように visible_origin_new を引く)
+        visible_origin_new_x = (viewport_w - visible_new_w) / 2
+        visible_origin_new_y = (viewport_h - visible_new_h) / 2
+        visible_anchor_new_x = anchor_x - visible_origin_new_x
+        visible_anchor_new_y = anchor_y - visible_origin_new_y
+
+        # 新 scaled 座標系での anchor 位置 = 正規化 × scaled_new
+        scaled_anchor_new_x = frac_x * scaled_new_w
+        scaled_anchor_new_y = frac_y * scaled_new_h
+
+        # 新 visible top-left in scaled = anchor_in_scaled - anchor_in_visible
+        vp_tl_new_x = scaled_anchor_new_x - visible_anchor_new_x
+        vp_tl_new_y = scaled_anchor_new_y - visible_anchor_new_y
+
+        # pan_offset = viewport_center - scaled_center
+        #            = (vp_tl + visible_size/2) - scaled_size/2
+        new_pan_x = vp_tl_new_x + visible_new_w / 2 - scaled_new_w / 2
+        new_pan_y = vp_tl_new_y + visible_new_h / 2 - scaled_new_h / 2
 
         self.zoom_level = z_new
         self.pan_offset_x = new_pan_x
@@ -1955,18 +2029,20 @@ finally {{
             fit_height = int(img_height * ratio)
             fit_size = (fit_width, fit_height)
 
-            # ズーム + パン適用後の crop 範囲を計算し、クランプされた pan で state を更新
+            # ズーム + パン適用後の crop 範囲・描画先サイズを計算。
+            # render_size は zoom > 1.0 で fit_size より大きく (viewport 寄りに) 広がり、
+            # フィット表示時の黒ぶちを段階的に埋めていく。
             zoom = self.zoom_level
-            crop_box, self.pan_offset_x, self.pan_offset_y = compute_zoom_crop(
+            crop_box, render_size, self.pan_offset_x, self.pan_offset_y = compute_zoom_crop(
                 (img_width, img_height),
                 fit_size,
+                (screen_width, screen_height),
                 zoom,
                 self.pan_offset_x,
                 self.pan_offset_y,
             )
             pan_signature = (round(self.pan_offset_x, 2), round(self.pan_offset_y, 2))
 
-            render_size = fit_size
             can_reuse_render = (
                 self.current_render_path == image_path
                 and self.current_render_size == render_size
@@ -2568,6 +2644,8 @@ finally {{
         if self.manual_check_after_id is not None:
             self.root.after_cancel(self.manual_check_after_id)
             self.manual_check_after_id = None
+        # 遅延予約された単一タップも破棄 (メニュー復帰後に発火しないように)
+        self.cancel_pending_single_tap()
         self.update_delete_button_state()
         self.request_render(layout=True)
 
@@ -2594,6 +2672,11 @@ finally {{
             self.clear_current_image_cache()
             # 画像が切り替わったらズームと注視位置を初期値へ戻す
             self.reset_zoom_state(request_render=False)
+            # 直前タップを単一タップ予約から外す。たとえばユーザがタップしてから
+            # 自動送り等で画像が切り替わったケースで、後追いの stale なタップ動作が
+            # 新しい画像に対して発火しないようにする。
+            self.cancel_pending_single_tap()
+            self._reset_double_tap_tracker()
         self.request_render(image=True, metadata=self.metadata_visible, thumbnail_highlight=True)
 
     def update_seekbar_range(self):
@@ -2619,12 +2702,41 @@ finally {{
             self.start_x = event.x
 
     def on_release(self, event):
-        """マウス/タッチのリリース（スワイプ・タップ判定）"""
-        # ズーム中のドラッグ pan は on_pan_drag_motion で逐次反映済み。
-        # 終了処理だけして、タップ/スワイプ判定はスキップする。
+        """マウス/タッチのリリース（スワイプ・タップ・ダブルタップ判定）"""
+        # ズーム中はドラッグの開始/終了が pan として処理されるが、移動量がごく
+        # 小さい (= 実質タップ) ならダブルタップ判定にフォールバックする。
+        # これが無いと「ズーム中はダブルタップが届かず、2x から先に進めない」
+        # 事態になる (= 旧バグ)。
         if self.pan_drag_active:
+            start_mx, start_my, start_px, start_py = self.pan_drag_start or (
+                event.x,
+                event.y,
+                self.pan_offset_x,
+                self.pan_offset_y,
+            )
             self.pan_drag_active = False
             self.pan_drag_start = None
+            moved = abs(event.x - start_mx) + abs(event.y - start_my)
+            if moved > DOUBLE_TAP_DISTANCE_PX:
+                # 実際の pan として確定。pan_offset は on_pan_drag_motion 中に
+                # 更新済み。pan が変化したので double-tap 追跡もリセットしておく。
+                self._reset_double_tap_tracker()
+                return
+            # 小さい移動 = タップ扱い。pan 中に若干 pan_offset がずれている
+            # 可能性があるので、押下開始時の値へ巻き戻す。
+            if self.pan_offset_x != start_px or self.pan_offset_y != start_py:
+                self.pan_offset_x = start_px
+                self.pan_offset_y = start_py
+                self.request_render(image=True)
+            # ダブルタップ判定。zoom_level の更新は _double_tap_cycle_zoom 経由で
+            # set_zoom_level が呼ばれるので render は coalesce される。
+            if self._is_double_tap_continuation(event):
+                self._reset_double_tap_tracker()
+                self._double_tap_cycle_zoom(event.x, event.y)
+            else:
+                # 次のタップが double-tap になる可能性があるので追跡開始
+                self.last_tap_time_ms = event.time
+                self.last_tap_pos = (event.x, event.y)
             return
 
         if self.start_x is None:
@@ -2637,29 +2749,122 @@ finally {{
             return
 
         diff_x = event.x - self.start_x
-        width = self.root.winfo_width()
-
-        # スワイプ判定 (移動量が50pxより大きい場合)
-        if abs(diff_x) > 50:
-            if diff_x < 0:
-                # 左スワイプ -> 次へ
-                self.next_image()
-            else:
-                # 右スワイプ -> 前へ
-                self.prev_image()
-        else:
-            # タップ判定 (移動量が少ない場合)
-            if event.x < width / 3:
-                # 画面左1/3 -> 前へ
-                self.prev_image()
-            elif event.x > width * 2 / 3:
-                # 画面右1/3 -> 次へ
-                self.next_image()
-            else:
-                # 画面中央1/3 -> シークバーの表示切替
-                self.toggle_seekbar()
-
         self.start_x = None
+
+        # スワイプ判定 (移動量が50pxより大きい場合) は即時発火。
+        # 既に予約されている単一タップとダブルタップ追跡もここでリセットしておく。
+        # こうしないと「タップ → 即スワイプ」で先のタップ動作が後から発火したり、
+        # 続く 1 タップがダブルタップ扱いになる事故が起きる。
+        if abs(diff_x) > 50:
+            self.cancel_pending_single_tap()
+            self._reset_double_tap_tracker()
+            if diff_x < 0:
+                self.next_image()
+            else:
+                self.prev_image()
+            return
+
+        # 純粋なタップ。直前のタップ release との時間 + 位置で double tap か判定。
+        # Tk の <Double-Button-1> は第 2 タップの「押下」で発火するため
+        # 「タップ + 即スワイプ」を swipe として扱えない。release ベースで自前判定。
+        if self._is_double_tap_continuation(event):
+            self.cancel_pending_single_tap()
+            self._reset_double_tap_tracker()
+            self._double_tap_cycle_zoom(event.x, event.y)
+            return
+
+        # 単一タップ候補: ダブルタップ追跡へ記録 + 単一タップ動作を遅延予約。
+        # DOUBLE_TAP_THRESHOLD_MS 以内に 2 タップ目が来れば次の on_release で
+        # double tap 確定 → 予約取消 + ズーム実行へ振り替える。
+        self.last_tap_time_ms = event.time
+        self.last_tap_pos = (event.x, event.y)
+        self.schedule_single_tap(event.x, event.y)
+
+    def _is_double_tap_continuation(self, event):
+        """直前のタップ release と近接 (時間・位置) ならダブルタップとみなす。"""
+        if self.last_tap_time_ms is None or self.last_tap_pos is None:
+            return False
+        # event.time は 32-bit uint で約 49.7 日ごとに wrap する。素直に減算すると
+        # wrap 直後の正当なダブルタップが負値になり捨ててしまうので、`& 0xFFFFFFFF`
+        # で常に「直前から進んだ ms 数」(非負) として解釈する。
+        # 「逆方向に進んだ」ケース (clock 調整等) は巨大値になり threshold を超える
+        # ので自然に False になる。
+        elapsed = (event.time - self.last_tap_time_ms) & 0xFFFFFFFF
+        if elapsed > DOUBLE_TAP_THRESHOLD_MS:
+            return False
+        prev_x, prev_y = self.last_tap_pos
+        return (
+            abs(event.x - prev_x) <= DOUBLE_TAP_DISTANCE_PX
+            and abs(event.y - prev_y) <= DOUBLE_TAP_DISTANCE_PX
+        )
+
+    def _reset_double_tap_tracker(self):
+        """ダブルタップ追跡 (直前タップの時刻・位置) をクリアする。"""
+        self.last_tap_time_ms = None
+        self.last_tap_pos = None
+
+    def _double_tap_cycle_zoom(self, tap_x, tap_y):
+        """ダブルタップ確定時の zoom サイクル動作。
+
+        - 第 2 タップの押下で開始された pan/swipe state も無効化する
+        - タップ位置をアンカーとして set_zoom_level に渡し、その地点が画面上で
+          動かないようにズーム
+        """
+        self.pan_drag_active = False
+        self.pan_drag_start = None
+        self.start_x = None
+        new_zoom = self._next_double_tap_zoom()
+        self.set_zoom_level(new_zoom, anchor_xy=(tap_x, tap_y))
+
+    def _next_double_tap_zoom(self):
+        """現在の zoom_level から見て「次にサイクルする」倍率を返す。
+
+        中間値 (1.5x, 3.0x 等) の場合は次に大きいサイクル値へスナップ。
+        最大値以上なら 1.0x に戻る。
+        """
+        current = self.zoom_level
+        for level in DOUBLE_TAP_ZOOM_LEVELS:
+            if current < level - 1e-3:
+                return level
+        return DOUBLE_TAP_ZOOM_LEVELS[0]
+
+    def schedule_single_tap(self, tap_x, tap_y):
+        """単一タップ動作を after() で遅延予約する。
+
+        既に予約済みなら一旦キャンセルして再予約 (連続タップで上書き)。
+        """
+        if self.pending_single_tap_id is not None:
+            self.root.after_cancel(self.pending_single_tap_id)
+            self.pending_single_tap_id = None
+        self.pending_single_tap_event = (tap_x, tap_y)
+        self.pending_single_tap_id = self.root.after(
+            DOUBLE_TAP_THRESHOLD_MS, self._fire_pending_single_tap
+        )
+
+    def cancel_pending_single_tap(self):
+        """予約済みの単一タップ動作を取り消す。"""
+        if self.pending_single_tap_id is not None:
+            self.root.after_cancel(self.pending_single_tap_id)
+            self.pending_single_tap_id = None
+        self.pending_single_tap_event = None
+
+    def _fire_pending_single_tap(self):
+        """遅延予約された単一タップ動作 (prev / next / panel toggle) を実行する。"""
+        self.pending_single_tap_id = None
+        evt = self.pending_single_tap_event
+        self.pending_single_tap_event = None
+        # 単一タップが確定した時点でダブルタップ追跡もリセット (state を最小限に保つ)
+        self._reset_double_tap_tracker()
+        if evt is None:
+            return
+        tap_x, _tap_y = evt
+        width = self.root.winfo_width()
+        if tap_x < width / 3:
+            self.prev_image()
+        elif tap_x > width * 2 / 3:
+            self.next_image()
+        else:
+            self.toggle_seekbar()
 
     def toggle_seekbar(self):
         """再生中の操作パネルの表示・非表示を切り替える"""
@@ -2746,6 +2951,7 @@ finally {{
         if self.manual_check_after_id is not None:
             self.root.after_cancel(self.manual_check_after_id)
             self.manual_check_after_id = None
+        self.cancel_pending_single_tap()
         self.clear_current_image_cache()
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
