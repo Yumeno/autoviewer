@@ -32,6 +32,79 @@ ZOOM_MAX = 5.0
 ZOOM_STEP_SLIDER = 0.1
 ZOOM_STEP_WHEEL = 0.25
 
+# Windows ピンチジェスチャ (GID_ZOOM) 用 setup。
+#
+# WndProc サブクラス化 (Python → C → Python のコールバック) は GIL 取扱いが
+# 厳しく、Python 3.13+ で pure-ctypes WINFUNCTYPE callback だと
+# "PyEval_RestoreThread: the GIL is released" Fatal error で即落ちする。
+# pywin32 の win32gui.SetWindowLong(GWL_WNDPROC, ...) は C 側のトランポリン
+# で PyGILState_Ensure を行うため Python 3.14 でも安全。
+#
+# 一方、GESTUREINFO 取得や SetGestureConfig は Python → C の output 呼び出し
+# なので GIL 問題は無く、ctypes のまま使う。
+#
+# pywin32 が import できない環境 (非 Windows / install 失敗) は
+# PINCH_AVAILABLE = False で全 no-op に倒す。
+PINCH_AVAILABLE = False
+if sys.platform.startswith("win"):
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import win32con
+        import win32gui
+
+        WM_GESTURE = 0x0119
+        GID_ZOOM = 3
+        GC_ZOOM = 0x00000001
+        GC_ALLGESTURES = 0x00000001
+        GF_BEGIN = 0x00000001
+        GF_INERTIA = 0x00000002
+        GF_END = 0x00000004
+
+        class _POINTS(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short)]
+
+        class GESTUREINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("dwFlags", wintypes.DWORD),
+                ("dwID", wintypes.DWORD),
+                ("hwndTarget", wintypes.HWND),
+                ("ptsLocation", _POINTS),
+                ("dwInstanceID", wintypes.DWORD),
+                ("dwSequenceID", wintypes.DWORD),
+                ("ullArguments", ctypes.c_ulonglong),
+                ("cbExtraArgs", wintypes.UINT),
+            ]
+
+        class GESTURECONFIG(ctypes.Structure):
+            _fields_ = [
+                ("dwID", wintypes.DWORD),
+                ("dwWant", wintypes.DWORD),
+                ("dwBlock", wintypes.DWORD),
+            ]
+
+        _user32 = ctypes.windll.user32
+        _user32.GetGestureInfo.restype = wintypes.BOOL
+        _user32.GetGestureInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(GESTUREINFO)]
+        _user32.CloseGestureInfoHandle.restype = wintypes.BOOL
+        _user32.CloseGestureInfoHandle.argtypes = [ctypes.c_void_p]
+        _user32.SetGestureConfig.restype = wintypes.BOOL
+        _user32.SetGestureConfig.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.UINT,
+            ctypes.POINTER(GESTURECONFIG),
+            wintypes.UINT,
+        ]
+        _user32.ScreenToClient.restype = wintypes.BOOL
+        _user32.ScreenToClient.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.POINT)]
+
+        PINCH_AVAILABLE = True
+    except Exception as _pinch_import_exc:
+        print(f"[pinch] disabled (import failed): {_pinch_import_exc}")
+        PINCH_AVAILABLE = False
+
 # Development-only debug switches.
 # Example:
 #   python viewer.py --debug resize,timeline,hud
@@ -327,6 +400,13 @@ class ImageViewerApp:
         self.pan_drag_active = False
         self.pan_drag_start = None  # (mouse_x, mouse_y, pan_x_start, pan_y_start)
 
+        # Windows ピンチジェスチャ用 state (他 OS では未使用)
+        self._pinch_old_wndproc = None  # 旧 WndProc アドレス (整数、pywin32 が返す)
+        self._pinch_hwnd = None  # サブクラス化した HWND
+        self._pinch_active = False
+        self._pinch_initial_distance = None
+        self._pinch_zoom_at_begin = 1.0
+
         self.metadata_panel_visible = False
         self.metadata_text_value = None
         self.metadata_cache = OrderedDict()
@@ -397,6 +477,10 @@ class ImageViewerApp:
         self.root.bind("<Configure>", self.on_root_configure)
 
         # ポーリングは start_slideshow / refresh_current_folder のタイミングで開始される。
+
+        # Windows ピンチジェスチャの hook を予約 (ウィンドウ realize 後に走る)
+        if PINCH_AVAILABLE:
+            self.root.after_idle(self.setup_pinch_gesture)
 
     def setup_ui(self):
         """設定画面と画像表示画面の構築"""
@@ -1001,6 +1085,183 @@ class ImageViewerApp:
         self.pan_offset_x = start_px - dx
         self.pan_offset_y = start_py - dy
         self.request_render(image=True)
+
+    # --- Windows ピンチジェスチャ (GID_ZOOM) -------------------------------------
+    # WndProc サブクラス化は pywin32 経由 (GIL を C 側で正しく扱うため)。
+    # GESTUREINFO 取得や SetGestureConfig は ctypes のまま (output 呼び出しは安全)。
+    # 非 Windows / pywin32 import 失敗環境では PINCH_AVAILABLE = False で全 no-op。
+    def setup_pinch_gesture(self):
+        """Windows のピンチジェスチャ (GID_ZOOM) を Tk ウィンドウへ hook する。
+
+        注意: root の HWND のみを subclass / configure する。Tk の child widget
+        (image_area 等) が独立 HWND を持つビルドでは WM_GESTURE が child 側
+        にしか届かない可能性があるが、通常の Python tkinter on Windows では
+        Toplevel が単一の HWND として全 client 領域を保持するので root への
+        hook で十分なはず。実機で取り損なう場合は image_area.winfo_id() 側にも
+        SetGestureConfig を行う拡張を検討する。
+        """
+        if not PINCH_AVAILABLE:
+            return
+        if self._pinch_old_wndproc is not None:
+            return  # 二重登録防止
+        try:
+            hwnd = int(self.root.winfo_id())
+        except Exception as exc:
+            print(f"[pinch] failed to get HWND: {exc}")
+            return
+        if hwnd == 0:
+            return
+
+        try:
+            # pywin32: SetWindowLong(GWL_WNDPROC, callable) で Python callable を
+            # WndProc として登録。返り値は旧 WndProc のアドレス (整数)。
+            old = win32gui.SetWindowLong(
+                hwnd, win32con.GWL_WNDPROC, self._pinch_wndproc
+            )
+            if not old:
+                print("[pinch] SetWindowLong returned 0 (no install)")
+                return
+            self._pinch_old_wndproc = old
+            self._pinch_hwnd = hwnd
+        except Exception as exc:
+            print(f"[pinch] subclass install failed: {exc}")
+            return
+
+        # ZOOM のみ有効化。MS の仕様上、dwID=0 (全 block) と他 GID は同一呼び出しで
+        # mix できないため 2 回に分けて呼ぶ。失敗してもログだけ出して継続する
+        # (デフォルト設定で動く環境もあるため)。
+        try:
+            block_all = GESTURECONFIG(dwID=0, dwWant=0, dwBlock=GC_ALLGESTURES)
+            ok1 = _user32.SetGestureConfig(
+                hwnd, 0, 1, ctypes.byref(block_all), ctypes.sizeof(GESTURECONFIG)
+            )
+            zoom_only = GESTURECONFIG(dwID=GID_ZOOM, dwWant=GC_ZOOM, dwBlock=0)
+            ok2 = _user32.SetGestureConfig(
+                hwnd, 0, 1, ctypes.byref(zoom_only), ctypes.sizeof(GESTURECONFIG)
+            )
+            if not ok1 or not ok2:
+                print(f"[pinch] SetGestureConfig partial failure: block={bool(ok1)} zoom={bool(ok2)}")
+        except Exception as exc:
+            print(f"[pinch] SetGestureConfig failed: {exc}")
+
+    def teardown_pinch_gesture(self):
+        """サブクラス化を解除して旧 WndProc を復帰する。on_closing から呼ばれる。"""
+        if not PINCH_AVAILABLE:
+            return
+        if self._pinch_hwnd is None or self._pinch_old_wndproc is None:
+            return
+        try:
+            win32gui.SetWindowLong(
+                self._pinch_hwnd,
+                win32con.GWL_WNDPROC,
+                self._pinch_old_wndproc,
+            )
+        except Exception as exc:
+            print(f"[pinch] teardown failed: {exc}")
+        finally:
+            self._pinch_old_wndproc = None
+            self._pinch_hwnd = None
+
+    def _pinch_wndproc(self, hwnd, msg, wparam, lparam):
+        """サブクラス化されたウィンドウプロシージャ本体。
+
+        WM_GESTURE のうち GID_ZOOM のみ拾い、それ以外のメッセージは旧プロシージャへ
+        そのまま素通しする。Python 側で例外が出ても C 側 (pywin32) に伝搬させない。
+        """
+        try:
+            if msg == WM_GESTURE:
+                if self._handle_gesture(lparam):
+                    return 0
+        except Exception as exc:
+            print(f"[pinch] WndProc error: {exc}")
+        # pywin32 の CallWindowProc は旧 WndProc アドレスをそのまま受け取る
+        return win32gui.CallWindowProc(
+            self._pinch_old_wndproc, hwnd, msg, wparam, lparam
+        )
+
+    def _handle_gesture(self, lparam):
+        """WM_GESTURE を分解。GID_ZOOM 以外は False を返して呼び出し側で素通しさせる。
+
+        Microsoft の規約: 処理した WM_GESTURE は自前で CloseGestureInfoHandle、
+        未処理で DefWindowProc / 旧 proc に forward する場合は handle の所有権ごと
+        渡す (= こちらでは close しない)。
+        """
+        gi = GESTUREINFO()
+        gi.cbSize = ctypes.sizeof(GESTUREINFO)
+        if not _user32.GetGestureInfo(ctypes.c_void_p(lparam), ctypes.byref(gi)):
+            return False
+
+        if gi.dwID != GID_ZOOM:
+            # 処理しないので handle を close せずに forward させる
+            return False
+
+        # GID_ZOOM は自前で処理 → handler 内の例外もここで握り、必ず handle を close
+        try:
+            self._on_pinch_zoom(gi)
+        except Exception as exc:
+            print(f"[pinch] zoom handler error: {exc}")
+        _user32.CloseGestureInfoHandle(ctypes.c_void_p(lparam))
+        return True
+
+    def _on_pinch_zoom(self, gi):
+        """GID_ZOOM のフェーズ別処理。
+
+        - GF_BEGIN: 2 本指間距離と現在 zoom を baseline として記録
+        - 中盤 (BEGIN/INERTIA/END 以外): 距離比 × baseline ズームをアンカーズームへ
+        - GF_END: state リセット
+        """
+        distance = float(gi.ullArguments)  # 2 contact 間の距離 (px)
+
+        if gi.dwFlags & GF_BEGIN:
+            self._pinch_active = True
+            self._pinch_initial_distance = distance if distance > 0 else None
+            self._pinch_zoom_at_begin = self.zoom_level
+            return
+
+        if gi.dwFlags & GF_END:
+            self._pinch_active = False
+            self._pinch_initial_distance = None
+            return
+
+        if (
+            not self._pinch_active
+            or self._pinch_initial_distance is None
+            or self._pinch_initial_distance <= 0
+            or distance <= 0
+        ):
+            return
+
+        scale = distance / self._pinch_initial_distance
+        new_zoom = self._pinch_zoom_at_begin * scale
+
+        # ピンチ中心 (ptsLocation は SCREEN 座標) → image_area の widget 座標へ
+        anchor_xy = self._screen_to_image_area(gi.ptsLocation.x, gi.ptsLocation.y)
+        self.set_zoom_level(new_zoom, anchor_xy=anchor_xy)
+
+    def _screen_to_image_area(self, screen_x, screen_y):
+        """SCREEN 座標を image_area 相対座標へ変換。失敗時は None を返す。
+
+        ScreenToClient で root の client 座標へ落とした上で、image_area が root
+        client 内のどの位置にあるかを引いて求める。DPI-unaware Python の前提
+        (今のところプロジェクトはマニフェストで DPI awareness を設定していない
+        ため、Tk の winfo_root* と Win32 の SCREEN 座標は同じ物理ピクセル空間)。
+        """
+        try:
+            if self._pinch_hwnd is not None:
+                pt = wintypes.POINT(int(screen_x), int(screen_y))
+                if _user32.ScreenToClient(
+                    ctypes.c_void_p(self._pinch_hwnd), ctypes.byref(pt)
+                ):
+                    area_offset_x = self.image_area.winfo_rootx() - self.root.winfo_rootx()
+                    area_offset_y = self.image_area.winfo_rooty() - self.root.winfo_rooty()
+                    return (pt.x - area_offset_x, pt.y - area_offset_y)
+            # フォールバック: SCREEN 座標から image_area の screen 位置を直接引く
+            return (
+                screen_x - self.image_area.winfo_rootx(),
+                screen_y - self.image_area.winfo_rooty(),
+            )
+        except Exception:
+            return None
 
     def update_delete_button_state(self):
         """削除・コピー・ファイラ表示ボタンの enable / disable を現在状態に合わせる。
@@ -2752,6 +3013,8 @@ finally {{
         self.cancel_thumbnail_follow()
         self.set_debug_hud_value("render_status", "idle")
         self.set_debug_hud_value("preview_status", "idle")
+        # ピンチ用 WndProc サブクラス化を解除してから destroy
+        self.teardown_pinch_gesture()
         self.root.destroy()
 
 if __name__ == "__main__":

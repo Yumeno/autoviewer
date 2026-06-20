@@ -1,1 +1,4 @@
 Pillow
+# Windows ピンチジェスチャ (GID_ZOOM) の WndProc サブクラス化に使用。
+# 非 Windows 環境ではインストールされない (環境マーカで除外)。
+pywin32; sys_platform == "win32"
