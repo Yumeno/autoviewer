@@ -26,6 +26,12 @@ POLL_SETTLE_MIN_MS = 500
 # 単発チェックボタンの 2 回スキャン間隔
 MANUAL_CHECK_GAP_MS = 100
 
+# ズーム (fit 表示を 1.0x の基準にした相対倍率)
+ZOOM_MIN = 1.0
+ZOOM_MAX = 5.0
+ZOOM_STEP_SLIDER = 0.1
+ZOOM_STEP_WHEEL = 0.25
+
 # Development-only debug switches.
 # Example:
 #   python viewer.py --debug resize,timeline,hud
@@ -116,6 +122,48 @@ def find_path_index(image_list, path):
         if os.path.normcase(os.path.normpath(p)) == target:
             return i
     return -1
+
+
+def compute_zoom_crop(source_size, fit_size, zoom, pan_x, pan_y):
+    """ズーム + パンを反映した「source 側のクロップ範囲」を求める。
+
+    pan_x / pan_y は **viewport (fit) ピクセル座標** での「中央からの平行移動量」。
+    返り値の pan_x_clamped / pan_y_clamped は viewport 端を超えないようにクランプされ
+    たもの。呼び出し側は受け取ったクランプ済み値で state を更新すること。
+
+    zoom <= 1.0 の場合: source 全体をクロップ範囲とし、pan は 0 に強制 (フィット表示)。
+    zoom > 1.0 の場合: 中央から (source / zoom) サイズを切り出し、pan ぶんずらす。
+    """
+    source_w, source_h = source_size
+    fit_w, fit_h = fit_size
+
+    if zoom <= 1.0 or source_w <= 0 or source_h <= 0 or fit_w <= 0 or fit_h <= 0:
+        return (0, 0, source_w, source_h), 0.0, 0.0
+
+    max_pan_x = fit_w * (zoom - 1) / 2
+    max_pan_y = fit_h * (zoom - 1) / 2
+    pan_x = max(-max_pan_x, min(max_pan_x, pan_x))
+    pan_y = max(-max_pan_y, min(max_pan_y, pan_y))
+
+    crop_w = source_w / zoom
+    crop_h = source_h / zoom
+    px_src = pan_x * source_w / (fit_w * zoom)
+    py_src = pan_y * source_h / (fit_h * zoom)
+
+    crop_left = (source_w / 2) + px_src - (crop_w / 2)
+    crop_top = (source_h / 2) + py_src - (crop_h / 2)
+    crop_right = crop_left + crop_w
+    crop_bottom = crop_top + crop_h
+
+    # 端で丸め誤差を吸収しつつ source 範囲内へクランプ。
+    # 極小画像 (source_w/h が 1〜数 px) や高 zoom で crop が 0 幅 / 0 高にならないよう、
+    # right > left, bottom > top を強制する。
+    crop_left = max(0, min(source_w - 1, int(round(crop_left))))
+    crop_top = max(0, min(source_h - 1, int(round(crop_top))))
+    crop_right = max(crop_left + 1, min(source_w, int(round(crop_right))))
+    crop_bottom = max(crop_top + 1, min(source_h, int(round(crop_bottom))))
+
+    return (crop_left, crop_top, crop_right, crop_bottom), pan_x, pan_y
 
 
 def move_to_trash(path):
@@ -267,7 +315,18 @@ class ImageViewerApp:
         self.current_render_path = None
         self.current_render_size = None
         self.current_render_resample = None
+        self.current_render_zoom = None
+        self.current_render_pan = None
         self.photo = None
+
+        # ズーム / パン状態 (fit 表示を 1.0x の基準)
+        self.zoom_level = 1.0
+        self.pan_offset_x = 0.0
+        self.pan_offset_y = 0.0
+        # ドラッグによるパン操作の途中状態
+        self.pan_drag_active = False
+        self.pan_drag_start = None  # (mouse_x, mouse_y, pan_x_start, pan_y_start)
+
         self.metadata_panel_visible = False
         self.metadata_text_value = None
         self.metadata_cache = OrderedDict()
@@ -402,7 +461,11 @@ class ImageViewerApp:
         # マウス（タッチ）イベントのバインド
         self.image_label.bind("<ButtonPress-1>", self.on_press)
         self.image_label.bind("<ButtonRelease-1>", self.on_release)
+        self.image_label.bind("<B1-Motion>", self.on_pan_drag_motion)
         self.image_label.bind("<Button-3>", self.show_context_menu)
+        # Ctrl + マウスホイールでズーム
+        self.image_label.bind("<Control-MouseWheel>", self.on_ctrl_mousewheel)
+        self.image_area.bind("<Control-MouseWheel>", self.on_ctrl_mousewheel)
 
         self.thumbnail_frame = tk.Frame(self.content_frame, bg='#161616', height=164, bd=1, relief=tk.SOLID)
         self.thumbnail_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
@@ -588,6 +651,47 @@ class ImageViewerApp:
         )
         self.copy_button.pack(side=tk.LEFT)
 
+        # 4 行目: ズーム操作
+        zoom_controls = tk.Frame(self.seekbar_frame, bg='#222222')
+        zoom_controls.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        tk.Label(zoom_controls, text="ズーム", fg='white', bg='#222222').pack(side=tk.LEFT, padx=(0, 8))
+
+        self.zoom_var = tk.DoubleVar(value=1.0)
+        self.zoom_scale = tk.Scale(
+            zoom_controls,
+            variable=self.zoom_var,
+            from_=ZOOM_MIN,
+            to=ZOOM_MAX,
+            resolution=ZOOM_STEP_SLIDER,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            bg='#222222',
+            fg='white',
+            troughcolor='#555555',
+            highlightthickness=0,
+            length=220,
+            command=self.on_zoom_slider_change,
+        )
+        self.zoom_scale.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.zoom_label_var = tk.StringVar(value="1.0x")
+        tk.Label(
+            zoom_controls,
+            textvariable=self.zoom_label_var,
+            fg='white',
+            bg='#222222',
+            width=6,
+        ).pack(side=tk.LEFT)
+
+        self.zoom_reset_button = tk.Button(
+            zoom_controls,
+            text="リセット",
+            width=8,
+            command=self.reset_zoom,
+        )
+        self.zoom_reset_button.pack(side=tk.LEFT, padx=(8, 0))
+
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(
             label="画像をファイルマネージャで表示",
@@ -744,6 +848,159 @@ class ImageViewerApp:
         else:
             self.cancel_polling()
         self.update_polling_status_ui()
+
+    def sync_zoom_ui(self):
+        """ズームの state を UI ウィジェットへ反映する。"""
+        if hasattr(self, "zoom_var"):
+            if abs(self.zoom_var.get() - self.zoom_level) > 1e-3:
+                self.zoom_var.set(self.zoom_level)
+        if hasattr(self, "zoom_label_var"):
+            self.zoom_label_var.set(f"{self.zoom_level:.1f}x")
+
+    def reset_zoom_state(self, *, request_render=True):
+        """ズーム倍率と注視位置を初期値 (1.0x / 中央) に戻す。
+
+        画像切替やフォルダ変更の直後に呼ばれ、新しい画像はまずフィット表示で
+        見せる挙動を担保する。
+        """
+        changed = (
+            self.zoom_level != 1.0
+            or self.pan_offset_x != 0.0
+            or self.pan_offset_y != 0.0
+        )
+        self.zoom_level = 1.0
+        self.pan_offset_x = 0.0
+        self.pan_offset_y = 0.0
+        self.pan_drag_active = False
+        self.pan_drag_start = None
+        self.sync_zoom_ui()
+        if changed and request_render:
+            self.request_render(image=True)
+
+    def reset_zoom(self):
+        """ズームリセットボタンのハンドラ。"""
+        self.reset_zoom_state(request_render=True)
+
+    def set_zoom_level(self, new_zoom, *, anchor_xy=None):
+        """ズーム倍率を絶対値で設定する。
+
+        anchor_xy: (x, y) を指定すると、その viewport 座標が同じ位置に
+        居続けるように pan を調整 (= マウス位置を軸にしたズーム)。None なら
+        中央軸のまま pan は据え置き。
+        """
+        new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, new_zoom))
+        if abs(new_zoom - self.zoom_level) < 1e-3:
+            return
+
+        old_zoom = self.zoom_level
+        if anchor_xy is not None and self.current_source_image is not None:
+            self._apply_anchored_zoom(new_zoom, anchor_xy[0], anchor_xy[1])
+        else:
+            self.zoom_level = new_zoom
+        # 倍率変更後は pan が範囲外になり得る。1.0x に戻したら強制 0。
+        if self.zoom_level <= 1.0:
+            self.pan_offset_x = 0.0
+            self.pan_offset_y = 0.0
+        if old_zoom != self.zoom_level:
+            self.sync_zoom_ui()
+            self.request_render(image=True)
+
+    def _apply_anchored_zoom(self, new_zoom, anchor_x, anchor_y):
+        """マウス位置を軸にズームし、anchor 位置が画面上で動かないように pan 更新。
+
+        anchor_x / anchor_y は image_area 座標系 (px)。fit 表示領域の外なら無視。
+        """
+        if self.current_source_image is None:
+            self.zoom_level = new_zoom
+            return
+
+        viewport_w, viewport_h = self.get_image_viewport_size()
+        img_w, img_h = self.current_source_image.size
+        if img_w <= 0 or img_h <= 0:
+            self.zoom_level = new_zoom
+            return
+
+        ratio = min(viewport_w / img_w, viewport_h / img_h)
+        fit_w = int(img_w * ratio)
+        fit_h = int(img_h * ratio)
+        if fit_w <= 0 or fit_h <= 0:
+            self.zoom_level = new_zoom
+            return
+
+        # image_label 内で fit 画像は中央に置かれる。anchor を fit 座標系へ変換。
+        # image_label は image_area いっぱい (fill=BOTH expand=True) なので、
+        # image_area 座標 ≒ image_label 座標として扱える。
+        fit_origin_x = (viewport_w - fit_w) / 2
+        fit_origin_y = (viewport_h - fit_h) / 2
+        fit_anchor_x = anchor_x - fit_origin_x
+        fit_anchor_y = anchor_y - fit_origin_y
+
+        # fit 画像の外でクリックされた場合は中央 (fit_w/2, fit_h/2) を anchor として
+        # 中央軸ズームに流す。「pan 据え置きでズーム値だけ変える」と画像中心が
+        # 微妙に動くのでここで意図的に中央を保持する。
+        if not (0 <= fit_anchor_x <= fit_w and 0 <= fit_anchor_y <= fit_h):
+            fit_anchor_x = fit_w / 2
+            fit_anchor_y = fit_h / 2
+
+        z_old = self.zoom_level
+        z_new = new_zoom
+
+        # 旧 viewport (= fit) 内での anchor 位置を、画像の正規化座標へ
+        # 旧 scaled 座標系での anchor 位置
+        scaled_anchor_old_x = fit_w * (z_old - 1) / 2 + self.pan_offset_x + fit_anchor_x
+        scaled_anchor_old_y = fit_h * (z_old - 1) / 2 + self.pan_offset_y + fit_anchor_y
+        # 0..1 の正規化座標
+        frac_x = scaled_anchor_old_x / (fit_w * z_old)
+        frac_y = scaled_anchor_old_y / (fit_h * z_old)
+
+        # 新 scaled 座標系で同じ画像位置を anchor として再計算
+        scaled_anchor_new_x = frac_x * fit_w * z_new
+        scaled_anchor_new_y = frac_y * fit_h * z_new
+        new_pan_x = scaled_anchor_new_x - fit_anchor_x - fit_w * (z_new - 1) / 2
+        new_pan_y = scaled_anchor_new_y - fit_anchor_y - fit_h * (z_new - 1) / 2
+
+        self.zoom_level = z_new
+        self.pan_offset_x = new_pan_x
+        self.pan_offset_y = new_pan_y
+
+    def on_zoom_slider_change(self, value):
+        """ズームスライダー変更時のハンドラ。"""
+        try:
+            new_zoom = round(float(value) / ZOOM_STEP_SLIDER) * ZOOM_STEP_SLIDER
+        except (TypeError, ValueError):
+            return
+        self.set_zoom_level(new_zoom)
+
+    def on_ctrl_mousewheel(self, event):
+        """Ctrl + マウスホイールで拡大 / 縮小。マウス位置を軸にする。"""
+        if not self.is_slideshow_active or self.current_source_image is None:
+            return None
+        # event.delta: Windows は ±120/notch、macOS は ±1〜数
+        direction = 1 if event.delta > 0 else -1
+        step = ZOOM_STEP_WHEEL * direction
+        # image_area 座標系でのアンカー位置 (event.x_root が画面座標)
+        anchor_x = event.x_root - self.image_area.winfo_rootx()
+        anchor_y = event.y_root - self.image_area.winfo_rooty()
+        self.set_zoom_level(self.zoom_level + step, anchor_xy=(anchor_x, anchor_y))
+        return "break"
+
+    def is_zoomed(self):
+        """ズーム中 (>1.0x) かどうか。タップ/スワイプとパンの分岐に使う。"""
+        return self.zoom_level > 1.0 + 1e-3
+
+    def on_pan_drag_motion(self, event):
+        """ズーム中のドラッグでパンする。"""
+        if not self.pan_drag_active or self.pan_drag_start is None:
+            return
+        start_mx, start_my, start_px, start_py = self.pan_drag_start
+        dx = event.x - start_mx
+        dy = event.y - start_my
+        # UX: 画像をつかんで動かす感覚にする。ドラッグ右 → 画像が右へ流れる →
+        # viewport は画像の左側を見ている = pan_offset_x はマイナス方向へ。
+        # つまり pan_offset の符号はドラッグ方向と逆になる。
+        self.pan_offset_x = start_px - dx
+        self.pan_offset_y = start_py - dy
+        self.request_render(image=True)
 
     def update_delete_button_state(self):
         """削除・コピー・ファイラ表示ボタンの enable / disable を現在状態に合わせる。
@@ -940,6 +1197,8 @@ class ImageViewerApp:
         self.current_render_path = None
         self.current_render_size = None
         self.current_render_resample = None
+        self.current_render_zoom = None
+        self.current_render_pan = None
 
     def cancel_image_open_retry(self):
         """画像オープンの遅延リトライ予約を取り消す"""
@@ -1692,25 +1951,45 @@ finally {{
 
             img_width, img_height = img.size
             ratio = min(screen_width / img_width, screen_height / img_height)
-            new_width = int(img_width * ratio)
-            new_height = int(img_height * ratio)
+            fit_width = int(img_width * ratio)
+            fit_height = int(img_height * ratio)
+            fit_size = (fit_width, fit_height)
 
-            render_size = (new_width, new_height)
+            # ズーム + パン適用後の crop 範囲を計算し、クランプされた pan で state を更新
+            zoom = self.zoom_level
+            crop_box, self.pan_offset_x, self.pan_offset_y = compute_zoom_crop(
+                (img_width, img_height),
+                fit_size,
+                zoom,
+                self.pan_offset_x,
+                self.pan_offset_y,
+            )
+            pan_signature = (round(self.pan_offset_x, 2), round(self.pan_offset_y, 2))
+
+            render_size = fit_size
             can_reuse_render = (
                 self.current_render_path == image_path
                 and self.current_render_size == render_size
                 and self.current_render_resample == resample
+                and self.current_render_zoom == zoom
+                and self.current_render_pan == pan_signature
                 and self.photo is not None
             )
 
             if can_reuse_render:
                 self.log_resize_debug(f"render_current_image reused existing render size={render_size}")
             else:
-                rendered_image = img.resize(render_size, resample)
+                if zoom > 1.0 and crop_box != (0, 0, img_width, img_height):
+                    cropped_image = img.crop(crop_box)
+                    rendered_image = cropped_image.resize(render_size, resample)
+                else:
+                    rendered_image = img.resize(render_size, resample)
                 self.current_render_image = rendered_image.copy()
                 self.current_render_path = image_path
                 self.current_render_size = render_size
                 self.current_render_resample = resample
+                self.current_render_zoom = zoom
+                self.current_render_pan = pan_signature
 
                 self.photo = ImageTk.PhotoImage(rendered_image)
                 self.image_label.config(image=self.photo)
@@ -2129,6 +2408,10 @@ finally {{
         # 単純な追加だけの場合はサムネ追加・seekbar 更新で必要な反映は完了している。
         needs_image_render = current_image_replaced or current_force_render
         if needs_image_render:
+            # current が別画像に切り替わった (= path 変化) 場合はズームを 1.0x に戻す。
+            # current_image_replaced (= 同 path での上書き) はズーム維持。
+            if current_force_render:
+                self.reset_zoom_state(request_render=False)
             self.request_render(
                 image=True,
                 metadata=self.metadata_visible,
@@ -2309,6 +2592,8 @@ finally {{
         current_path = self.get_current_image_path()
         if current_path != self.current_source_path:
             self.clear_current_image_cache()
+            # 画像が切り替わったらズームと注視位置を初期値へ戻す
+            self.reset_zoom_state(request_render=False)
         self.request_render(image=True, metadata=self.metadata_visible, thumbnail_highlight=True)
 
     def update_seekbar_range(self):
@@ -2318,16 +2603,42 @@ finally {{
 
     def on_press(self, event):
         """マウス/タッチの押下開始"""
-        self.start_x = event.x
+        if self.is_zoomed():
+            # ズーム中はドラッグを pan として扱う。タップ/スワイプ系は無効。
+            self.pan_drag_active = True
+            self.pan_drag_start = (
+                event.x,
+                event.y,
+                self.pan_offset_x,
+                self.pan_offset_y,
+            )
+            self.start_x = None
+        else:
+            self.pan_drag_active = False
+            self.pan_drag_start = None
+            self.start_x = event.x
 
     def on_release(self, event):
         """マウス/タッチのリリース（スワイプ・タップ判定）"""
+        # ズーム中のドラッグ pan は on_pan_drag_motion で逐次反映済み。
+        # 終了処理だけして、タップ/スワイプ判定はスキップする。
+        if self.pan_drag_active:
+            self.pan_drag_active = False
+            self.pan_drag_start = None
+            return
+
         if self.start_x is None:
             return
-            
+
+        # 押下時は 1.0x だったが、押下中に Ctrl+Wheel / スライダー等で zoom > 1.0x
+        # になっていたら tap/swipe は仕様に反するので抑止する。
+        if self.is_zoomed():
+            self.start_x = None
+            return
+
         diff_x = event.x - self.start_x
         width = self.root.winfo_width()
-        
+
         # スワイプ判定 (移動量が50pxより大きい場合)
         if abs(diff_x) > 50:
             if diff_x < 0:
@@ -2347,7 +2658,7 @@ finally {{
             else:
                 # 画面中央1/3 -> シークバーの表示切替
                 self.toggle_seekbar()
-                
+
         self.start_x = None
 
     def toggle_seekbar(self):
