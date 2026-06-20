@@ -133,31 +133,49 @@ def find_path_index(image_list, path):
     return -1
 
 
-def compute_zoom_crop(source_size, fit_size, zoom, pan_x, pan_y):
-    """ズーム + パンを反映した「source 側のクロップ範囲」を求める。
+def compute_zoom_crop(source_size, fit_size, viewport_size, zoom, pan_x, pan_y):
+    """ズーム + パンを反映した「source 側のクロップ範囲」と「描画先サイズ」を求める。
 
     pan_x / pan_y は **viewport (fit) ピクセル座標** での「中央からの平行移動量」。
-    返り値の pan_x_clamped / pan_y_clamped は viewport 端を超えないようにクランプされ
-    たもの。呼び出し側は受け取ったクランプ済み値で state を更新すること。
+    返り値の pan_x_clamped / pan_y_clamped は端を超えないようにクランプ済み。
 
-    zoom <= 1.0 の場合: source 全体をクロップ範囲とし、pan は 0 に強制 (フィット表示)。
-    zoom > 1.0 の場合: 中央から (source / zoom) サイズを切り出し、pan ぶんずらす。
+    zoom = 1.0 ではフィット表示 (画像サイズと viewport が違えば黒ぶちが残る)。
+    zoom > 1.0 では「拡大したぶん、これまで黒ぶちだった領域も使い切る」挙動にする。
+    具体的には表示サイズ = min(viewport, scaled) として、空いている軸方向で描画領域
+    を広げる。これによりズーム時に上下 / 左右の黒ぶちが消える。
+
+    返り値:
+        (crop_box, render_size, pan_x_clamped, pan_y_clamped)
+        crop_box: PIL crop 用 (left, top, right, bottom) (source 座標系)
+        render_size: cropped image を resize する先のピクセルサイズ
+                    (zoom <= 1.0 では fit_size、zoom > 1.0 では viewport 寄りに広がる)
     """
     source_w, source_h = source_size
     fit_w, fit_h = fit_size
+    viewport_w, viewport_h = viewport_size
 
     if zoom <= 1.0 or source_w <= 0 or source_h <= 0 or fit_w <= 0 or fit_h <= 0:
-        return (0, 0, source_w, source_h), 0.0, 0.0
+        return (0, 0, source_w, source_h), fit_size, 0.0, 0.0
 
-    max_pan_x = fit_w * (zoom - 1) / 2
-    max_pan_y = fit_h * (zoom - 1) / 2
+    scaled_w = fit_w * zoom
+    scaled_h = fit_h * zoom
+
+    # ズーム時の表示領域: viewport いっぱい使うが scaled を超えない。
+    # これにより、ズーム前は黒ぶちだった軸方向にも画像表示が広がっていく。
+    visible_w = max(1.0, min(viewport_w, scaled_w))
+    visible_h = max(1.0, min(viewport_h, scaled_h))
+
+    # pan の可動域 (表示領域が scaled 内をどこまでスライドできるか)
+    max_pan_x = max(0.0, (scaled_w - visible_w) / 2)
+    max_pan_y = max(0.0, (scaled_h - visible_h) / 2)
     pan_x = max(-max_pan_x, min(max_pan_x, pan_x))
     pan_y = max(-max_pan_y, min(max_pan_y, pan_y))
 
-    crop_w = source_w / zoom
-    crop_h = source_h / zoom
-    px_src = pan_x * source_w / (fit_w * zoom)
-    py_src = pan_y * source_h / (fit_h * zoom)
+    # source 側でのクロップサイズ / オフセット
+    crop_w = source_w * visible_w / scaled_w
+    crop_h = source_h * visible_h / scaled_h
+    px_src = pan_x * source_w / scaled_w
+    py_src = pan_y * source_h / scaled_h
 
     crop_left = (source_w / 2) + px_src - (crop_w / 2)
     crop_top = (source_h / 2) + py_src - (crop_h / 2)
@@ -172,7 +190,8 @@ def compute_zoom_crop(source_size, fit_size, zoom, pan_x, pan_y):
     crop_right = max(crop_left + 1, min(source_w, int(round(crop_right))))
     crop_bottom = max(crop_top + 1, min(source_h, int(round(crop_bottom))))
 
-    return (crop_left, crop_top, crop_right, crop_bottom), pan_x, pan_y
+    render_size = (max(1, int(round(visible_w))), max(1, int(round(visible_h))))
+    return (crop_left, crop_top, crop_right, crop_bottom), render_size, pan_x, pan_y
 
 
 def move_to_trash(path):
@@ -926,7 +945,12 @@ class ImageViewerApp:
     def _apply_anchored_zoom(self, new_zoom, anchor_x, anchor_y):
         """マウス位置を軸にズームし、anchor 位置が画面上で動かないように pan 更新。
 
-        anchor_x / anchor_y は image_area 座標系 (px)。fit 表示領域の外なら無視。
+        anchor_x / anchor_y は image_area 座標系 (px)。表示領域 (visible) の外なら
+        中央軸扱いに倒す。
+
+        新ズームモデル (黒ぶち解消) に対応: zoom > 1.0 では表示領域 (visible) が
+        min(viewport, scaled) になるため、anchor の解釈と pan 再計算は visible
+        基準で行う。
         """
         if self.current_source_image is None:
             self.zoom_level = new_zoom
@@ -945,37 +969,69 @@ class ImageViewerApp:
             self.zoom_level = new_zoom
             return
 
-        # image_label 内で fit 画像は中央に置かれる。anchor を fit 座標系へ変換。
-        # image_label は image_area いっぱい (fill=BOTH expand=True) なので、
-        # image_area 座標 ≒ image_label 座標として扱える。
-        fit_origin_x = (viewport_w - fit_w) / 2
-        fit_origin_y = (viewport_h - fit_h) / 2
-        fit_anchor_x = anchor_x - fit_origin_x
-        fit_anchor_y = anchor_y - fit_origin_y
-
-        # fit 画像の外でクリックされた場合は中央 (fit_w/2, fit_h/2) を anchor として
-        # 中央軸ズームに流す。「pan 据え置きでズーム値だけ変える」と画像中心が
-        # 微妙に動くのでここで意図的に中央を保持する。
-        if not (0 <= fit_anchor_x <= fit_w and 0 <= fit_anchor_y <= fit_h):
-            fit_anchor_x = fit_w / 2
-            fit_anchor_y = fit_h / 2
-
         z_old = self.zoom_level
         z_new = new_zoom
 
-        # 旧 viewport (= fit) 内での anchor 位置を、画像の正規化座標へ
-        # 旧 scaled 座標系での anchor 位置
-        scaled_anchor_old_x = fit_w * (z_old - 1) / 2 + self.pan_offset_x + fit_anchor_x
-        scaled_anchor_old_y = fit_h * (z_old - 1) / 2 + self.pan_offset_y + fit_anchor_y
-        # 0..1 の正規化座標
-        frac_x = scaled_anchor_old_x / (fit_w * z_old)
-        frac_y = scaled_anchor_old_y / (fit_h * z_old)
+        # 旧 / 新 zoom 時点の表示領域 (visible) サイズ
+        scaled_old_w = max(1.0, fit_w * z_old)
+        scaled_old_h = max(1.0, fit_h * z_old)
+        scaled_new_w = max(1.0, fit_w * z_new)
+        scaled_new_h = max(1.0, fit_h * z_new)
+        visible_old_w = min(viewport_w, scaled_old_w)
+        visible_old_h = min(viewport_h, scaled_old_h)
+        visible_new_w = min(viewport_w, scaled_new_w)
+        visible_new_h = min(viewport_h, scaled_new_h)
+        if visible_old_w <= 0 or visible_old_h <= 0:
+            self.zoom_level = new_zoom
+            return
 
-        # 新 scaled 座標系で同じ画像位置を anchor として再計算
-        scaled_anchor_new_x = frac_x * fit_w * z_new
-        scaled_anchor_new_y = frac_y * fit_h * z_new
-        new_pan_x = scaled_anchor_new_x - fit_anchor_x - fit_w * (z_new - 1) / 2
-        new_pan_y = scaled_anchor_new_y - fit_anchor_y - fit_h * (z_new - 1) / 2
+        # image_area 内で visible は中央に配置される。anchor を visible 座標系へ。
+        visible_origin_old_x = (viewport_w - visible_old_w) / 2
+        visible_origin_old_y = (viewport_h - visible_old_h) / 2
+        visible_anchor_old_x = anchor_x - visible_origin_old_x
+        visible_anchor_old_y = anchor_y - visible_origin_old_y
+
+        # 表示領域の外 (黒ぶち位置 / 領域外) でのアクションは中央軸ズームへ。
+        # 「pan 据え置きでズーム値だけ変える」と画像中心が微妙に動くのでここで
+        # 意図的に中央を保持する。
+        if not (
+            0 <= visible_anchor_old_x <= visible_old_w
+            and 0 <= visible_anchor_old_y <= visible_old_h
+        ):
+            visible_anchor_old_x = visible_old_w / 2
+            visible_anchor_old_y = visible_old_h / 2
+
+        # 旧 scaled 座標系での anchor 位置
+        # viewport 中心 = scaled 中心 + pan_offset
+        # visible top-left in scaled = viewport_center - visible_size/2
+        vp_tl_old_x = scaled_old_w / 2 + self.pan_offset_x - visible_old_w / 2
+        vp_tl_old_y = scaled_old_h / 2 + self.pan_offset_y - visible_old_h / 2
+        scaled_anchor_old_x = vp_tl_old_x + visible_anchor_old_x
+        scaled_anchor_old_y = vp_tl_old_y + visible_anchor_old_y
+
+        # 画像内正規化座標 (0..1)
+        frac_x = scaled_anchor_old_x / scaled_old_w
+        frac_y = scaled_anchor_old_y / scaled_old_h
+
+        # 新 zoom での anchor の visible 座標系位置 (visible サイズが変わるので
+        # image_area 上の anchor 位置が変わらないように visible_origin_new を引く)
+        visible_origin_new_x = (viewport_w - visible_new_w) / 2
+        visible_origin_new_y = (viewport_h - visible_new_h) / 2
+        visible_anchor_new_x = anchor_x - visible_origin_new_x
+        visible_anchor_new_y = anchor_y - visible_origin_new_y
+
+        # 新 scaled 座標系での anchor 位置 = 正規化 × scaled_new
+        scaled_anchor_new_x = frac_x * scaled_new_w
+        scaled_anchor_new_y = frac_y * scaled_new_h
+
+        # 新 visible top-left in scaled = anchor_in_scaled - anchor_in_visible
+        vp_tl_new_x = scaled_anchor_new_x - visible_anchor_new_x
+        vp_tl_new_y = scaled_anchor_new_y - visible_anchor_new_y
+
+        # pan_offset = viewport_center - scaled_center
+        #            = (vp_tl + visible_size/2) - scaled_size/2
+        new_pan_x = vp_tl_new_x + visible_new_w / 2 - scaled_new_w / 2
+        new_pan_y = vp_tl_new_y + visible_new_h / 2 - scaled_new_h / 2
 
         self.zoom_level = z_new
         self.pan_offset_x = new_pan_x
@@ -1973,18 +2029,20 @@ finally {{
             fit_height = int(img_height * ratio)
             fit_size = (fit_width, fit_height)
 
-            # ズーム + パン適用後の crop 範囲を計算し、クランプされた pan で state を更新
+            # ズーム + パン適用後の crop 範囲・描画先サイズを計算。
+            # render_size は zoom > 1.0 で fit_size より大きく (viewport 寄りに) 広がり、
+            # フィット表示時の黒ぶちを段階的に埋めていく。
             zoom = self.zoom_level
-            crop_box, self.pan_offset_x, self.pan_offset_y = compute_zoom_crop(
+            crop_box, render_size, self.pan_offset_x, self.pan_offset_y = compute_zoom_crop(
                 (img_width, img_height),
                 fit_size,
+                (screen_width, screen_height),
                 zoom,
                 self.pan_offset_x,
                 self.pan_offset_y,
             )
             pan_signature = (round(self.pan_offset_x, 2), round(self.pan_offset_y, 2))
 
-            render_size = fit_size
             can_reuse_render = (
                 self.current_render_path == image_path
                 and self.current_render_size == render_size
