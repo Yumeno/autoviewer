@@ -31,6 +31,15 @@ ZOOM_MIN = 1.0
 ZOOM_MAX = 5.0
 ZOOM_STEP_SLIDER = 0.1
 ZOOM_STEP_WHEEL = 0.25
+# ダブルタップでサイクルするズーム倍率 (この値群を 1.0x→2.0x→4.0x→1.0x の順に巡回)
+DOUBLE_TAP_ZOOM_LEVELS = (1.0, 2.0, 4.0)
+# 単一タップとダブルタップの区別に使う待ち時間 (ms)。
+# 単一タップ動作はこの間隔だけ遅延予約され、その間に 2 タップ目が来れば
+# 予約はキャンセルされてダブルタップ動作 (zoom cycle) に切り替わる。
+DOUBLE_TAP_THRESHOLD_MS = 300
+# ダブルタップとして連続認定する 2 タップ間の許容距離 (px)。
+# これを超えて離れた位置の連打は別々の単一タップとして扱う。
+DOUBLE_TAP_DISTANCE_PX = 30
 
 # Development-only debug switches.
 # Example:
@@ -326,6 +335,15 @@ class ImageViewerApp:
         # ドラッグによるパン操作の途中状態
         self.pan_drag_active = False
         self.pan_drag_start = None  # (mouse_x, mouse_y, pan_x_start, pan_y_start)
+
+        # 単一タップとダブルタップ区別用 (1x 表示時の単一タップを後追い実行する仕組み)
+        self.pending_single_tap_id = None  # after() 予約 ID
+        self.pending_single_tap_event = None  # 遅延実行する単一タップのイベント情報
+        # ダブルタップ検出用に「直前のタップ release 時刻 + 位置」を保持する。
+        # Tk の <Double-Button-1> は第 2 タップの押下時に発火するため「タップ + 即スワイプ」
+        # の swipe を取りこぼす。代わりに release 時刻ベースで自前検出する。
+        self.last_tap_time_ms = None  # event.time (ms)
+        self.last_tap_pos = None  # (event.x, event.y)
 
         self.metadata_panel_visible = False
         self.metadata_text_value = None
@@ -2568,6 +2586,8 @@ finally {{
         if self.manual_check_after_id is not None:
             self.root.after_cancel(self.manual_check_after_id)
             self.manual_check_after_id = None
+        # 遅延予約された単一タップも破棄 (メニュー復帰後に発火しないように)
+        self.cancel_pending_single_tap()
         self.update_delete_button_state()
         self.request_render(layout=True)
 
@@ -2594,6 +2614,11 @@ finally {{
             self.clear_current_image_cache()
             # 画像が切り替わったらズームと注視位置を初期値へ戻す
             self.reset_zoom_state(request_render=False)
+            # 直前タップを単一タップ予約から外す。たとえばユーザがタップしてから
+            # 自動送り等で画像が切り替わったケースで、後追いの stale なタップ動作が
+            # 新しい画像に対して発火しないようにする。
+            self.cancel_pending_single_tap()
+            self._reset_double_tap_tracker()
         self.request_render(image=True, metadata=self.metadata_visible, thumbnail_highlight=True)
 
     def update_seekbar_range(self):
@@ -2619,7 +2644,7 @@ finally {{
             self.start_x = event.x
 
     def on_release(self, event):
-        """マウス/タッチのリリース（スワイプ・タップ判定）"""
+        """マウス/タッチのリリース（スワイプ・タップ・ダブルタップ判定）"""
         # ズーム中のドラッグ pan は on_pan_drag_motion で逐次反映済み。
         # 終了処理だけして、タップ/スワイプ判定はスキップする。
         if self.pan_drag_active:
@@ -2637,29 +2662,122 @@ finally {{
             return
 
         diff_x = event.x - self.start_x
-        width = self.root.winfo_width()
-
-        # スワイプ判定 (移動量が50pxより大きい場合)
-        if abs(diff_x) > 50:
-            if diff_x < 0:
-                # 左スワイプ -> 次へ
-                self.next_image()
-            else:
-                # 右スワイプ -> 前へ
-                self.prev_image()
-        else:
-            # タップ判定 (移動量が少ない場合)
-            if event.x < width / 3:
-                # 画面左1/3 -> 前へ
-                self.prev_image()
-            elif event.x > width * 2 / 3:
-                # 画面右1/3 -> 次へ
-                self.next_image()
-            else:
-                # 画面中央1/3 -> シークバーの表示切替
-                self.toggle_seekbar()
-
         self.start_x = None
+
+        # スワイプ判定 (移動量が50pxより大きい場合) は即時発火。
+        # 既に予約されている単一タップとダブルタップ追跡もここでリセットしておく。
+        # こうしないと「タップ → 即スワイプ」で先のタップ動作が後から発火したり、
+        # 続く 1 タップがダブルタップ扱いになる事故が起きる。
+        if abs(diff_x) > 50:
+            self.cancel_pending_single_tap()
+            self._reset_double_tap_tracker()
+            if diff_x < 0:
+                self.next_image()
+            else:
+                self.prev_image()
+            return
+
+        # 純粋なタップ。直前のタップ release との時間 + 位置で double tap か判定。
+        # Tk の <Double-Button-1> は第 2 タップの「押下」で発火するため
+        # 「タップ + 即スワイプ」を swipe として扱えない。release ベースで自前判定。
+        if self._is_double_tap_continuation(event):
+            self.cancel_pending_single_tap()
+            self._reset_double_tap_tracker()
+            self._double_tap_cycle_zoom(event.x, event.y)
+            return
+
+        # 単一タップ候補: ダブルタップ追跡へ記録 + 単一タップ動作を遅延予約。
+        # DOUBLE_TAP_THRESHOLD_MS 以内に 2 タップ目が来れば次の on_release で
+        # double tap 確定 → 予約取消 + ズーム実行へ振り替える。
+        self.last_tap_time_ms = event.time
+        self.last_tap_pos = (event.x, event.y)
+        self.schedule_single_tap(event.x, event.y)
+
+    def _is_double_tap_continuation(self, event):
+        """直前のタップ release と近接 (時間・位置) ならダブルタップとみなす。"""
+        if self.last_tap_time_ms is None or self.last_tap_pos is None:
+            return False
+        # event.time は 32-bit uint で約 49.7 日ごとに wrap する。素直に減算すると
+        # wrap 直後の正当なダブルタップが負値になり捨ててしまうので、`& 0xFFFFFFFF`
+        # で常に「直前から進んだ ms 数」(非負) として解釈する。
+        # 「逆方向に進んだ」ケース (clock 調整等) は巨大値になり threshold を超える
+        # ので自然に False になる。
+        elapsed = (event.time - self.last_tap_time_ms) & 0xFFFFFFFF
+        if elapsed > DOUBLE_TAP_THRESHOLD_MS:
+            return False
+        prev_x, prev_y = self.last_tap_pos
+        return (
+            abs(event.x - prev_x) <= DOUBLE_TAP_DISTANCE_PX
+            and abs(event.y - prev_y) <= DOUBLE_TAP_DISTANCE_PX
+        )
+
+    def _reset_double_tap_tracker(self):
+        """ダブルタップ追跡 (直前タップの時刻・位置) をクリアする。"""
+        self.last_tap_time_ms = None
+        self.last_tap_pos = None
+
+    def _double_tap_cycle_zoom(self, tap_x, tap_y):
+        """ダブルタップ確定時の zoom サイクル動作。
+
+        - 第 2 タップの押下で開始された pan/swipe state も無効化する
+        - タップ位置をアンカーとして set_zoom_level に渡し、その地点が画面上で
+          動かないようにズーム
+        """
+        self.pan_drag_active = False
+        self.pan_drag_start = None
+        self.start_x = None
+        new_zoom = self._next_double_tap_zoom()
+        self.set_zoom_level(new_zoom, anchor_xy=(tap_x, tap_y))
+
+    def _next_double_tap_zoom(self):
+        """現在の zoom_level から見て「次にサイクルする」倍率を返す。
+
+        中間値 (1.5x, 3.0x 等) の場合は次に大きいサイクル値へスナップ。
+        最大値以上なら 1.0x に戻る。
+        """
+        current = self.zoom_level
+        for level in DOUBLE_TAP_ZOOM_LEVELS:
+            if current < level - 1e-3:
+                return level
+        return DOUBLE_TAP_ZOOM_LEVELS[0]
+
+    def schedule_single_tap(self, tap_x, tap_y):
+        """単一タップ動作を after() で遅延予約する。
+
+        既に予約済みなら一旦キャンセルして再予約 (連続タップで上書き)。
+        """
+        if self.pending_single_tap_id is not None:
+            self.root.after_cancel(self.pending_single_tap_id)
+            self.pending_single_tap_id = None
+        self.pending_single_tap_event = (tap_x, tap_y)
+        self.pending_single_tap_id = self.root.after(
+            DOUBLE_TAP_THRESHOLD_MS, self._fire_pending_single_tap
+        )
+
+    def cancel_pending_single_tap(self):
+        """予約済みの単一タップ動作を取り消す。"""
+        if self.pending_single_tap_id is not None:
+            self.root.after_cancel(self.pending_single_tap_id)
+            self.pending_single_tap_id = None
+        self.pending_single_tap_event = None
+
+    def _fire_pending_single_tap(self):
+        """遅延予約された単一タップ動作 (prev / next / panel toggle) を実行する。"""
+        self.pending_single_tap_id = None
+        evt = self.pending_single_tap_event
+        self.pending_single_tap_event = None
+        # 単一タップが確定した時点でダブルタップ追跡もリセット (state を最小限に保つ)
+        self._reset_double_tap_tracker()
+        if evt is None:
+            return
+        tap_x, _tap_y = evt
+        width = self.root.winfo_width()
+        if tap_x < width / 3:
+            self.prev_image()
+        elif tap_x > width * 2 / 3:
+            self.next_image()
+        else:
+            self.toggle_seekbar()
 
     def toggle_seekbar(self):
         """再生中の操作パネルの表示・非表示を切り替える"""
@@ -2746,6 +2864,7 @@ finally {{
         if self.manual_check_after_id is not None:
             self.root.after_cancel(self.manual_check_after_id)
             self.manual_check_after_id = None
+        self.cancel_pending_single_tap()
         self.clear_current_image_cache()
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
