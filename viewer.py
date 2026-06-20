@@ -566,6 +566,28 @@ class ImageViewerApp:
         )
         self.delete_button.pack(side=tk.LEFT)
 
+        # 3 行目: 右クリックメニュー相当のファイル操作 (タッチ環境向け)
+        tertiary_controls = tk.Frame(self.seekbar_frame, bg='#222222')
+        tertiary_controls.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        self.reveal_button = tk.Button(
+            tertiary_controls,
+            text="ファイラで表示",
+            width=14,
+            command=self.reveal_current_image_in_file_manager,
+            state=tk.DISABLED,
+        )
+        self.reveal_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.copy_button = tk.Button(
+            tertiary_controls,
+            text="コピー",
+            width=10,
+            command=self.copy_current_image_to_clipboard,
+            state=tk.DISABLED,
+        )
+        self.copy_button.pack(side=tk.LEFT)
+
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(
             label="画像をファイルマネージャで表示",
@@ -724,22 +746,28 @@ class ImageViewerApp:
         self.update_polling_status_ui()
 
     def update_delete_button_state(self):
-        """削除ボタンの enable / disable を現在状態に合わせる。
+        """削除・コピー・ファイラ表示ボタンの enable / disable を現在状態に合わせる。
 
-        有効条件:
-        - スライドショー実行中
-        - 一時停止中 (is_playing == False)
-        - 現在表示中の画像がある
-        いずれか欠けたら disable。"""
-        button = getattr(self, "delete_button", None)
-        if button is None:
-            return
-        enabled = (
+        削除は破壊的操作なので一時停止中限定、コピー / ファイラ表示は非破壊なので
+        現在画像があれば常に有効。
+        """
+        delete_button = getattr(self, "delete_button", None)
+        if delete_button is not None:
+            enabled = (
+                self.is_slideshow_active
+                and not self.is_playing
+                and self.get_current_image_path() is not None
+            )
+            delete_button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+        has_current = (
             self.is_slideshow_active
-            and not self.is_playing
             and self.get_current_image_path() is not None
         )
-        button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+        for attr in ("reveal_button", "copy_button"):
+            button = getattr(self, attr, None)
+            if button is not None:
+                button.config(state=tk.NORMAL if has_current else tk.DISABLED)
 
     def delete_current_image(self):
         """現在表示中の画像をゴミ箱へ送る (確認ダイアログ付き)。
