@@ -41,6 +41,34 @@ DOUBLE_TAP_THRESHOLD_MS = 300
 # これを超えて離れた位置の連打は別々の単一タップとして扱う。
 DOUBLE_TAP_DISTANCE_PX = 30
 
+# Museum テーマ (ダークギャラリー):
+#   黒地に最小限のタングステン照明色アクセント。
+#   作品 (画像) が主役、コントロールは精緻な壁プレート。
+MUSEUM_BG_BASE = '#0A0A0A'           # main canvas background
+MUSEUM_BG_SURFACE = '#1C1C1C'        # buttons / inputs / surfaces
+MUSEUM_BG_HOVER = '#2A2A2A'          # hover / pressed state
+MUSEUM_BG_INPUT = '#141414'          # text entry inner
+MUSEUM_FG_PRIMARY = '#F5F5F5'        # primary text (95% white)
+MUSEUM_FG_SECONDARY = '#888888'      # secondary / muted
+MUSEUM_FG_DISABLED = '#555555'       # disabled state text
+MUSEUM_BORDER = '#3F3F3F'            # divider lines
+MUSEUM_ACCENT = '#D4A574'            # tungsten light (primary action)
+MUSEUM_ACCENT_HOVER = '#E6BC8E'      # accent hover (lighter tungsten)
+MUSEUM_DANGER = '#8B2E2E'            # delete only
+MUSEUM_DANGER_HOVER = '#A04040'
+MUSEUM_STATUS_OK = '#7CB342'         # active / positive state (polling ON, etc.)
+
+# Museum タイポグラフィ。Windows 標準フォントで構成。
+MUSEUM_FONT_DISPLAY = ('Georgia', 28)
+MUSEUM_FONT_DISPLAY_SMALL = ('Georgia', 18)
+MUSEUM_FONT_SECTION = ('Consolas', 9, 'bold')    # uppercase mono headers
+MUSEUM_FONT_BODY = ('Segoe UI', 10)
+MUSEUM_FONT_BUTTON = ('Segoe UI', 10)
+MUSEUM_FONT_BUTTON_PRIMARY = ('Georgia', 13)
+MUSEUM_FONT_NUMBER = ('Consolas', 10)
+MUSEUM_FONT_NUMBER_LARGE = ('Consolas', 13)
+MUSEUM_FONT_HELP = ('Segoe UI', 9)
+
 # Development-only debug switches.
 # Example:
 #   python viewer.py --debug resize,timeline,hud
@@ -318,9 +346,10 @@ def _trash_linux(abs_path):
 class ImageViewerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Auto Image Viewer")
-        self.root.geometry("500x400")
-        self.root.configure(bg='black')
+        self.root.title("Art Viewer")
+        self.root.geometry("720x680")
+        self.root.minsize(560, 480)
+        self.root.configure(bg=MUSEUM_BG_BASE)
 
         # アプリの状態変数
         self.folder_path = ""
@@ -435,63 +464,170 @@ class ImageViewerApp:
 
         # ポーリングは start_slideshow / refresh_current_folder のタイミングで開始される。
 
+    # ---- Museum theme helpers ------------------------------------------------
+    def _museum_button(self, parent, text, command, variant='default', width=None, **extra):
+        """Museum テーマ統一スタイルのボタンを生成。
+
+        variant:
+            'default' — グレー地、白文字 (一般操作)
+            'primary' — タングステン色地、黒文字 (重要操作: 「開始」など)
+            'danger'  — 暗赤地、白文字 (削除)
+            'subtle'  — 透明地、グレー文字 (二次操作: 「閉じる」「終了」)
+            'accent'  — 透明地、タングステン色文字 (アクティブ状態のトグル)
+            'status'  — 透明地、緑文字 (status OK のトグル)
+        """
+        variant_styles = {
+            'default': (MUSEUM_BG_SURFACE, MUSEUM_FG_PRIMARY, MUSEUM_BG_HOVER, MUSEUM_FG_PRIMARY),
+            'primary': (MUSEUM_ACCENT, MUSEUM_BG_BASE, MUSEUM_ACCENT_HOVER, MUSEUM_BG_BASE),
+            'danger': (MUSEUM_DANGER, MUSEUM_FG_PRIMARY, MUSEUM_DANGER_HOVER, MUSEUM_FG_PRIMARY),
+            'subtle': (MUSEUM_BG_BASE, MUSEUM_FG_SECONDARY, MUSEUM_BG_SURFACE, MUSEUM_FG_PRIMARY),
+            'accent': (MUSEUM_BG_BASE, MUSEUM_ACCENT, MUSEUM_BG_SURFACE, MUSEUM_ACCENT_HOVER),
+            'status': (MUSEUM_BG_BASE, MUSEUM_STATUS_OK, MUSEUM_BG_SURFACE, MUSEUM_STATUS_OK),
+        }
+        bg, fg, ab, af = variant_styles.get(variant, variant_styles['default'])
+        kwargs = dict(
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=ab,
+            activeforeground=af,
+            disabledforeground=MUSEUM_FG_DISABLED,
+            relief=tk.FLAT,
+            bd=0,
+            padx=14,
+            pady=8,
+            font=MUSEUM_FONT_BUTTON,
+            cursor='hand2',
+            highlightthickness=0,
+        )
+        if width is not None:
+            kwargs['width'] = width
+        kwargs.update(extra)
+        return tk.Button(parent, **kwargs)
+
+    def _museum_separator(self, parent, indent=0):
+        """1px の細い区切り線。indent でフレーム内余白を調整。"""
+        wrapper = tk.Frame(parent, bg=parent.cget('bg'))
+        line = tk.Frame(wrapper, bg=MUSEUM_BORDER, height=1)
+        line.pack(fill=tk.X, padx=indent)
+        return wrapper
+
+    def _museum_section_header(self, parent, text):
+        """セクション見出し (mono, uppercase, secondary color)。"""
+        return tk.Label(
+            parent,
+            text=text.upper(),
+            bg=parent.cget('bg'),
+            fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_SECTION,
+            anchor='w',
+        )
+
+    def _museum_label(self, parent, text, **kwargs):
+        """Museum 標準スタイルのラベル。"""
+        defaults = dict(
+            bg=parent.cget('bg'),
+            fg=MUSEUM_FG_PRIMARY,
+            font=MUSEUM_FONT_BODY,
+            anchor='w',
+        )
+        defaults.update(kwargs)
+        return tk.Label(parent, text=text, **defaults)
+
+    def _museum_entry(self, parent, textvariable, width=6):
+        """Museum 標準スタイルの数値入力。"""
+        return tk.Entry(
+            parent,
+            textvariable=textvariable,
+            width=width,
+            bg=MUSEUM_BG_INPUT,
+            fg=MUSEUM_FG_PRIMARY,
+            insertbackground=MUSEUM_ACCENT,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=MUSEUM_BORDER,
+            highlightcolor=MUSEUM_ACCENT,
+            font=MUSEUM_FONT_NUMBER_LARGE,
+            justify=tk.CENTER,
+        )
+
     def setup_ui(self):
-        """設定画面と画像表示画面の構築"""
-        self.content_frame = tk.Frame(self.root, bg='black')
+        """設定画面と画像表示画面の構築 (Museum テーマ)"""
+        # ルート背景を Museum 黒地に
+        self.root.configure(bg=MUSEUM_BG_BASE)
+
+        # --- 主領域: 画像表示 + メタ情報パネル + サムネ帯 ----------------------
+        self.content_frame = tk.Frame(self.root, bg=MUSEUM_BG_BASE)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
         self.content_frame.grid_rowconfigure(0, weight=1)
         self.content_frame.grid_columnconfigure(0, weight=1)
         self.content_frame.grid_columnconfigure(1, weight=0)
 
-        self.image_area = tk.Frame(self.content_frame, bg='black')
+        self.image_area = tk.Frame(self.content_frame, bg=MUSEUM_BG_BASE)
         self.image_area.grid(row=0, column=0, sticky="nsew")
 
-        self.metadata_frame = tk.Frame(self.content_frame, bg='#141414', width=360, bd=1, relief=tk.SOLID)
-        self.metadata_frame.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
+        # メタ情報パネル (右カラム)
+        self.metadata_frame = tk.Frame(
+            self.content_frame,
+            bg=MUSEUM_BG_SURFACE,
+            width=380,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=MUSEUM_BORDER,
+        )
+        self.metadata_frame.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
         self.metadata_frame.grid_remove()
         self.metadata_frame.pack_propagate(False)
         self.metadata_header = tk.Label(
             self.metadata_frame,
-            text="Image Info",
-            bg='#141414',
-            fg='white',
+            text="IMAGE INFO",
+            bg=MUSEUM_BG_SURFACE,
+            fg=MUSEUM_FG_SECONDARY,
             anchor='w',
-            padx=12,
-            pady=8,
-            font=("Helvetica", 10, "bold")
+            padx=16,
+            pady=12,
+            font=MUSEUM_FONT_SECTION,
         )
         self.metadata_header.pack(fill=tk.X)
+        # 見出し下に細い区切り
+        self._museum_separator(self.metadata_frame, indent=12).pack(fill=tk.X)
         self.metadata_text = tk.Text(
             self.metadata_frame,
-            bg='#141414',
-            fg='white',
+            bg=MUSEUM_BG_SURFACE,
+            fg=MUSEUM_FG_PRIMARY,
             wrap=tk.WORD,
             relief=tk.FLAT,
+            bd=0,
             highlightthickness=0,
-            padx=12,
-            pady=12
+            padx=16,
+            pady=14,
+            font=MUSEUM_FONT_BODY,
+            insertbackground=MUSEUM_ACCENT,
         )
         self.metadata_scrollbar = tk.Scrollbar(self.metadata_frame, command=self.metadata_text.yview)
         self.metadata_text.configure(yscrollcommand=self.metadata_scrollbar.set, state=tk.DISABLED)
         self.metadata_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.metadata_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=8, padx=(0, 8))
+        self.metadata_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=10, padx=(0, 10))
 
         # 画像表示用のラベル
-        self.image_label = tk.Label(self.image_area, bg='black')
+        self.image_label = tk.Label(self.image_area, bg=MUSEUM_BG_BASE)
         self.image_label.pack(fill=tk.BOTH, expand=True)
 
         if DEBUG_HUD:
             self.debug_hud_label = tk.Label(
                 self.image_area,
-                bg='#101010',
+                bg=MUSEUM_BG_INPUT,
                 fg='#9FE870',
                 justify=tk.LEFT,
                 anchor='nw',
                 padx=8,
                 pady=6,
                 font=("Consolas", 9),
-                bd=1,
-                relief=tk.SOLID,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=MUSEUM_BORDER,
             )
             self.debug_hud_label.place(x=12, y=12)
 
@@ -500,314 +636,478 @@ class ImageViewerApp:
         self.image_label.bind("<ButtonRelease-1>", self.on_release)
         self.image_label.bind("<B1-Motion>", self.on_pan_drag_motion)
         self.image_label.bind("<Button-3>", self.show_context_menu)
-        # Ctrl + マウスホイールでズーム
         self.image_label.bind("<Control-MouseWheel>", self.on_ctrl_mousewheel)
         self.image_area.bind("<Control-MouseWheel>", self.on_ctrl_mousewheel)
 
-        self.thumbnail_frame = tk.Frame(self.content_frame, bg='#161616', height=164, bd=1, relief=tk.SOLID)
-        self.thumbnail_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        # サムネイル帯 (下端)
+        self.thumbnail_frame = tk.Frame(
+            self.content_frame,
+            bg=MUSEUM_BG_SURFACE,
+            height=170,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=MUSEUM_BORDER,
+        )
+        self.thumbnail_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
         self.thumbnail_frame.grid_remove()
         self.thumbnail_frame.grid_propagate(False)
         self.thumbnail_header = tk.Label(
             self.thumbnail_frame,
-            text="Thumbnail Carousel",
-            bg='#161616',
-            fg='white',
+            text="THUMBNAILS",
+            bg=MUSEUM_BG_SURFACE,
+            fg=MUSEUM_FG_SECONDARY,
             anchor='w',
-            padx=12,
-            pady=6,
-            font=("Helvetica", 10, "bold")
+            padx=16,
+            pady=8,
+            font=MUSEUM_FONT_SECTION,
         )
         self.thumbnail_header.pack(fill=tk.X)
+        self._museum_separator(self.thumbnail_frame, indent=12).pack(fill=tk.X)
         self.thumbnail_canvas = tk.Canvas(
             self.thumbnail_frame,
-            bg='#161616',
+            bg=MUSEUM_BG_SURFACE,
             height=116,
-            highlightthickness=0
+            bd=0,
+            highlightthickness=0,
         )
         self.thumbnail_scrollbar = tk.Scrollbar(
             self.thumbnail_frame,
             orient=tk.HORIZONTAL,
-            command=self.thumbnail_canvas.xview
+            command=self.thumbnail_canvas.xview,
         )
-        self.thumbnail_inner = tk.Frame(self.thumbnail_canvas, bg='#161616')
+        self.thumbnail_inner = tk.Frame(self.thumbnail_canvas, bg=MUSEUM_BG_SURFACE)
         self.thumbnail_window = self.thumbnail_canvas.create_window((0, 0), window=self.thumbnail_inner, anchor=tk.NW)
         self.thumbnail_canvas.configure(xscrollcommand=self.thumbnail_scrollbar.set)
-        self.thumbnail_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 0))
-        self.thumbnail_scrollbar.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.thumbnail_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
+        self.thumbnail_scrollbar.pack(fill=tk.X, padx=10, pady=(0, 10))
         self.thumbnail_inner.bind("<Configure>", self.on_thumbnail_inner_configure)
         self.thumbnail_canvas.bind("<Configure>", self.on_thumbnail_canvas_configure)
         self.thumbnail_frame.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
         self.thumbnail_canvas.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
         self.thumbnail_inner.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
 
-        # 再生中の操作パネル
-        self.seekbar_frame = tk.Frame(self.root, bg='#222222', bd=2, relief=tk.RAISED)
-        self.seekbar_var = tk.IntVar()
-        self.seekbar = tk.Scale(
-            self.seekbar_frame,
-            variable=self.seekbar_var,
-            orient=tk.HORIZONTAL,
-            showvalue=True,
-            bg='#222222',
-            fg='white',
-            troughcolor='#555555',
-            highlightthickness=0,
-            command=self.on_seek
+        # コンテキストメニュー (右クリック / Museum スタイル)
+        self.context_menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=MUSEUM_BG_SURFACE,
+            fg=MUSEUM_FG_PRIMARY,
+            activebackground=MUSEUM_ACCENT,
+            activeforeground=MUSEUM_BG_BASE,
+            bd=0,
+            font=MUSEUM_FONT_BODY,
         )
-        self.seekbar.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 4))
-
-        primary_controls = tk.Frame(self.seekbar_frame, bg='#222222')
-        primary_controls.pack(fill=tk.X, padx=10, pady=(0, 6))
-
-        self.fullscreen_button = tk.Button(
-            primary_controls,
-            text="最大化解除",
-            width=10,
-            command=self.toggle_fullscreen_mode
-        )
-        self.fullscreen_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.play_pause_button = tk.Button(
-            primary_controls,
-            text="一時停止",
-            width=10,
-            command=self.toggle_play,
-            bg='#4CAF50',
-            fg='white'
-        )
-        self.play_pause_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.change_folder_button = tk.Button(
-            primary_controls,
-            text="フォルダ変更",
-            width=12,
-            command=self.change_folder_during_slideshow
-        )
-        self.change_folder_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.interval_status_var = tk.StringVar()
-        tk.Label(
-            primary_controls,
-            textvariable=self.interval_status_var,
-            fg='white',
-            bg='#222222'
-        ).pack(side=tk.LEFT)
-
-        self.return_to_menu_button = tk.Button(
-            primary_controls,
-            text="設定画面へ戻る",
-            width=14,
-            command=self.return_to_menu
-        )
-        self.return_to_menu_button.pack(side=tk.RIGHT, padx=(10, 0))
-
-        self.quit_button = tk.Button(
-            primary_controls,
-            text="終了",
-            width=8,
-            command=self.on_closing
-        )
-        self.quit_button.pack(side=tk.RIGHT, padx=(10, 0))
-
-        self.close_panel_button = tk.Button(
-            primary_controls,
-            text="閉じる",
-            width=8,
-            command=self.toggle_seekbar
-        )
-        self.close_panel_button.pack(side=tk.RIGHT)
-
-        secondary_controls = tk.Frame(self.seekbar_frame, bg='#222222')
-        secondary_controls.pack(fill=tk.X, padx=10, pady=(0, 6))
-
-        self.thumbnail_toggle_button = tk.Button(
-            secondary_controls,
-            text="サムネイル表示",
-            width=12,
-            command=self.toggle_thumbnail_panel
-        )
-        self.thumbnail_toggle_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.metadata_toggle_button = tk.Button(
-            secondary_controls,
-            text="情報欄表示",
-            width=12,
-            command=self.toggle_metadata_panel
-        )
-        self.metadata_toggle_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.polling_toggle_button = tk.Button(
-            secondary_controls,
-            text="監視ON",
-            width=10,
-            command=self.toggle_polling,
-        )
-        self.polling_toggle_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.manual_check_button = tk.Button(
-            secondary_controls,
-            text="即時チェック",
-            width=12,
-            command=self.request_manual_check,
-        )
-        self.manual_check_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        # 削除ボタン: 一時停止中のみ enable。常に確認ダイアログを出してから削除する。
-        self.delete_button = tk.Button(
-            secondary_controls,
-            text="削除",
-            width=8,
-            command=self.delete_current_image,
-            bg='#C62828',
-            fg='white',
-            disabledforeground='#777777',
-            state=tk.DISABLED,
-        )
-        self.delete_button.pack(side=tk.LEFT)
-
-        # 3 行目: 右クリックメニュー相当のファイル操作 (タッチ環境向け)
-        tertiary_controls = tk.Frame(self.seekbar_frame, bg='#222222')
-        tertiary_controls.pack(fill=tk.X, padx=10, pady=(0, 6))
-
-        self.reveal_button = tk.Button(
-            tertiary_controls,
-            text="ファイラで表示",
-            width=14,
-            command=self.reveal_current_image_in_file_manager,
-            state=tk.DISABLED,
-        )
-        self.reveal_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.copy_button = tk.Button(
-            tertiary_controls,
-            text="コピー",
-            width=10,
-            command=self.copy_current_image_to_clipboard,
-            state=tk.DISABLED,
-        )
-        self.copy_button.pack(side=tk.LEFT)
-
-        # 4 行目: ズーム操作
-        zoom_controls = tk.Frame(self.seekbar_frame, bg='#222222')
-        zoom_controls.pack(fill=tk.X, padx=10, pady=(0, 6))
-
-        tk.Label(zoom_controls, text="ズーム", fg='white', bg='#222222').pack(side=tk.LEFT, padx=(0, 8))
-
-        self.zoom_var = tk.DoubleVar(value=1.0)
-        self.zoom_scale = tk.Scale(
-            zoom_controls,
-            variable=self.zoom_var,
-            from_=ZOOM_MIN,
-            to=ZOOM_MAX,
-            resolution=ZOOM_STEP_SLIDER,
-            orient=tk.HORIZONTAL,
-            showvalue=False,
-            bg='#222222',
-            fg='white',
-            troughcolor='#555555',
-            highlightthickness=0,
-            length=220,
-            command=self.on_zoom_slider_change,
-        )
-        self.zoom_scale.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.zoom_label_var = tk.StringVar(value="1.0x")
-        tk.Label(
-            zoom_controls,
-            textvariable=self.zoom_label_var,
-            fg='white',
-            bg='#222222',
-            width=6,
-        ).pack(side=tk.LEFT)
-
-        self.zoom_reset_button = tk.Button(
-            zoom_controls,
-            text="リセット",
-            width=8,
-            command=self.reset_zoom,
-        )
-        self.zoom_reset_button.pack(side=tk.LEFT, padx=(8, 0))
-
-        self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(
             label="画像をファイルマネージャで表示",
-            command=self.reveal_current_image_in_file_manager
+            command=self.reveal_current_image_in_file_manager,
         )
         self.context_menu.add_command(
             label="画像をクリップボードにコピー",
-            command=self.copy_current_image_to_clipboard
+            command=self.copy_current_image_to_clipboard,
         )
+
+        # --- 再生中の操作パネル (Museum: ゾーン分割) ---------------------------
+        self.seekbar_frame = tk.Frame(
+            self.root,
+            bg=MUSEUM_BG_BASE,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=MUSEUM_BORDER,
+        )
+        self._build_operation_panel(self.seekbar_frame)
+        self.seekbar_visible = False
+
+        # --- 起動時の設定画面 (Museum: 余白を確保したフォーム) -----------------
+        self.menu_frame = tk.Frame(self.root, bg=MUSEUM_BG_BASE)
+        self.menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self._build_settings_screen(self.menu_frame)
+
+    def _build_operation_panel(self, parent):
+        """Museum テーマの操作パネル本体を組み立てる。
+
+        ゾーン構成 (上から):
+          1. SEEKBAR (シーク + index + interval)
+          2. PLAYBACK (一時停止 / 前 / 次 / 最大化)
+          3. VIEW & FILE (サムネ・情報・監視・チェック・削除 / コピー・ファイラ・フォルダ)
+          4. ZOOM & INTERVAL (スライダー類)
+          5. EXIT (設定戻る・終了・閉じる、右寄せ)
+        """
+        pad_x = 20
+        pad_y_zone = 12
+
+        # === Zone 1: SEEKBAR ====================================================
+        seek_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        seek_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, 6))
+
+        self.seekbar_var = tk.IntVar()
+        self.seekbar = tk.Scale(
+            seek_zone,
+            variable=self.seekbar_var,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_PRIMARY,
+            troughcolor=MUSEUM_BG_HOVER,
+            activebackground=MUSEUM_ACCENT,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief=tk.FLAT,
+            sliderlength=24,
+            command=self.on_seek,
+        )
+        self.seekbar.pack(fill=tk.X, side=tk.TOP)
+
+        meta_row = tk.Frame(seek_zone, bg=MUSEUM_BG_BASE)
+        meta_row.pack(fill=tk.X, pady=(2, 0))
+
+        # 左: index 表示 (mono、 23 / 1247 形式)
+        self.seekbar_index_var = tk.StringVar(value="—")
+        tk.Label(
+            meta_row,
+            textvariable=self.seekbar_index_var,
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_PRIMARY,
+            font=MUSEUM_FONT_NUMBER_LARGE,
+        ).pack(side=tk.LEFT)
+
+        # 右: interval status (mono、5.0 SEC 形式)
+        self.interval_status_var = tk.StringVar()
+        tk.Label(
+            meta_row,
+            textvariable=self.interval_status_var,
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_NUMBER,
+        ).pack(side=tk.RIGHT)
+
+        # 区切り線
+        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X, pady=(pad_y_zone, 0))
+
+        # === Zone 2: PLAYBACK ===================================================
+        playback_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        playback_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
+
+        self._museum_section_header(playback_zone, "PLAYBACK").pack(anchor='w', pady=(0, 6))
+
+        playback_buttons = tk.Frame(playback_zone, bg=MUSEUM_BG_BASE)
+        playback_buttons.pack(anchor='w')
+
+        self.play_pause_button = self._museum_button(
+            playback_buttons, "一時停止", self.toggle_play, variant='primary', width=10,
+        )
+        self.play_pause_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._museum_button(
+            playback_buttons, "前へ", self.prev_image, variant='default', width=8,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self._museum_button(
+            playback_buttons, "次へ", self.next_image, variant='default', width=8,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.fullscreen_button = self._museum_button(
+            playback_buttons, "最大化解除", self.toggle_fullscreen_mode, variant='default', width=10,
+        )
+        self.fullscreen_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        # 区切り線
+        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X)
+
+        # === Zone 3: VIEW + FILE ================================================
+        viewfile_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        viewfile_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
+
+        # 表示トグル列
+        self._museum_section_header(viewfile_zone, "VIEW").pack(anchor='w', pady=(0, 6))
+        view_buttons = tk.Frame(viewfile_zone, bg=MUSEUM_BG_BASE)
+        view_buttons.pack(anchor='w', pady=(0, 10))
+
+        self.thumbnail_toggle_button = self._museum_button(
+            view_buttons, "サムネ ○", self.toggle_thumbnail_panel, variant='default', width=10,
+        )
+        self.thumbnail_toggle_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.metadata_toggle_button = self._museum_button(
+            view_buttons, "情報 ○", self.toggle_metadata_panel, variant='default', width=10,
+        )
+        self.metadata_toggle_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.polling_toggle_button = self._museum_button(
+            view_buttons, "監視 ●", self.toggle_polling, variant='status', width=10,
+        )
+        self.polling_toggle_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.manual_check_button = self._museum_button(
+            view_buttons, "即時チェック", self.request_manual_check, variant='default', width=12,
+        )
+        self.manual_check_button.pack(side=tk.LEFT)
+
+        # ファイル操作列
+        self._museum_section_header(viewfile_zone, "FILE").pack(anchor='w', pady=(0, 6))
+        file_buttons = tk.Frame(viewfile_zone, bg=MUSEUM_BG_BASE)
+        file_buttons.pack(anchor='w')
+
+        self.delete_button = self._museum_button(
+            file_buttons, "削除", self.delete_current_image, variant='danger', width=8,
+            state=tk.DISABLED,
+        )
+        self.delete_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.copy_button = self._museum_button(
+            file_buttons, "コピー", self.copy_current_image_to_clipboard,
+            variant='default', width=8, state=tk.DISABLED,
+        )
+        self.copy_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.reveal_button = self._museum_button(
+            file_buttons, "ファイラで表示", self.reveal_current_image_in_file_manager,
+            variant='default', width=14, state=tk.DISABLED,
+        )
+        self.reveal_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.change_folder_button = self._museum_button(
+            file_buttons, "フォルダ変更", self.change_folder_during_slideshow,
+            variant='default', width=12,
+        )
+        self.change_folder_button.pack(side=tk.LEFT)
+
+        # 区切り線
+        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X)
+
+        # === Zone 4: ZOOM + INTERVAL スライダー =================================
+        sliders_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        sliders_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
+
+        # ZOOM 行
+        zoom_row = tk.Frame(sliders_zone, bg=MUSEUM_BG_BASE)
+        zoom_row.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(
+            zoom_row, text="ZOOM",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_SECTION, width=10, anchor='w',
+        ).pack(side=tk.LEFT)
+
+        self.zoom_var = tk.DoubleVar(value=1.0)
+        self.zoom_scale = tk.Scale(
+            zoom_row,
+            variable=self.zoom_var,
+            from_=ZOOM_MIN, to=ZOOM_MAX,
+            resolution=ZOOM_STEP_SLIDER,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_PRIMARY,
+            troughcolor=MUSEUM_BG_HOVER,
+            activebackground=MUSEUM_ACCENT,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief=tk.FLAT,
+            sliderlength=24,
+            length=240,
+            command=self.on_zoom_slider_change,
+        )
+        self.zoom_scale.pack(side=tk.LEFT, padx=(8, 8))
+
+        self.zoom_label_var = tk.StringVar(value="1.0x")
+        tk.Label(
+            zoom_row, textvariable=self.zoom_label_var,
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_PRIMARY,
+            font=MUSEUM_FONT_NUMBER_LARGE, width=6,
+        ).pack(side=tk.LEFT)
+
+        self.zoom_reset_button = self._museum_button(
+            zoom_row, "リセット", self.reset_zoom, variant='subtle', width=8,
+        )
+        self.zoom_reset_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        # INTERVAL 行
+        interval_row = tk.Frame(sliders_zone, bg=MUSEUM_BG_BASE)
+        interval_row.pack(fill=tk.X)
+
+        tk.Label(
+            interval_row, text="INTERVAL",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_SECTION, width=10, anchor='w',
+        ).pack(side=tk.LEFT)
 
         self.interval_scale_var = tk.DoubleVar()
         self.interval_scale = tk.Scale(
-            self.seekbar_frame,
+            interval_row,
             variable=self.interval_scale_var,
-            from_=MIN_INTERVAL_SECONDS,
-            to=MAX_INTERVAL_SECONDS,
+            from_=MIN_INTERVAL_SECONDS, to=MAX_INTERVAL_SECONDS,
             resolution=INTERVAL_STEP_SECONDS,
             orient=tk.HORIZONTAL,
             showvalue=False,
-            bg='#222222',
-            fg='white',
-            troughcolor='#555555',
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_PRIMARY,
+            troughcolor=MUSEUM_BG_HOVER,
+            activebackground=MUSEUM_ACCENT,
             highlightthickness=0,
-            label="自動送り間隔 (秒)",
-            command=self.on_interval_change
+            bd=0,
+            sliderrelief=tk.FLAT,
+            sliderlength=24,
+            length=240,
+            command=self.on_interval_change,
         )
-        self.interval_scale.pack(fill=tk.X, padx=10, pady=(0, 8))
-        self.seekbar_visible = False
+        self.interval_scale.pack(side=tk.LEFT, padx=(8, 8))
 
-        # 設定メニュー用フレーム
-        self.menu_frame = tk.Frame(self.root, bg='#333333', padx=20, pady=20)
-        self.menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        # 区切り線
+        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X)
 
-        title_label = tk.Label(self.menu_frame, text="画像ビューアー 設定", fg='white', bg='#333333', font=("Helvetica", 16, "bold"))
-        title_label.pack(pady=(0, 20))
+        # === Zone 5: EXIT (右寄せ) ==============================================
+        exit_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        exit_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
+
+        self.close_panel_button = self._museum_button(
+            exit_zone, "閉じる", self.toggle_seekbar, variant='subtle', width=8,
+        )
+        self.close_panel_button.pack(side=tk.RIGHT)
+
+        self.quit_button = self._museum_button(
+            exit_zone, "終了", self.on_closing, variant='subtle', width=8,
+        )
+        self.quit_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.return_to_menu_button = self._museum_button(
+            exit_zone, "設定画面へ戻る", self.return_to_menu, variant='subtle', width=14,
+        )
+        self.return_to_menu_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _build_settings_screen(self, parent):
+        """Museum テーマの起動 / 設定画面を組み立てる。"""
+        # ディスプレイ幅の調整 (中央寄せ + 一定幅)
+        content = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        content.pack(padx=48, pady=40)
+
+        # --- Title ---
+        tk.Label(
+            content, text="A R T   V I E W E R",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_PRIMARY,
+            font=MUSEUM_FONT_DISPLAY,
+        ).pack(pady=(0, 4))
+
+        # タイトル下の細いアクセント線
+        accent_underline = tk.Frame(content, bg=MUSEUM_ACCENT, height=2, width=120)
+        accent_underline.pack(pady=(0, 36))
+        accent_underline.pack_propagate(False)
+
+        # --- Section: 監視対象フォルダ ---
+        self._museum_section_header(content, "対象フォルダ").pack(anchor='w', pady=(0, 8))
+
+        folder_row = tk.Frame(content, bg=MUSEUM_BG_BASE)
+        folder_row.pack(fill=tk.X, pady=(0, 4))
 
         self.folder_var = tk.StringVar(value="フォルダが選択されていません")
-        tk.Label(self.menu_frame, textvariable=self.folder_var, fg='white', bg='#333333').pack(pady=5)
-        
-        tk.Button(self.menu_frame, text="1. フォルダを選択", command=self.select_folder, width=20).pack(pady=5)
-        
+        folder_display = tk.Label(
+            folder_row, textvariable=self.folder_var,
+            bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_BODY,
+            anchor='w',
+            padx=14, pady=10,
+            bd=0, highlightthickness=1, highlightbackground=MUSEUM_BORDER,
+            width=44,
+        )
+        folder_display.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._museum_button(
+            folder_row, "選択", self.select_folder, variant='default', width=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # 区切り
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+        self._museum_separator(content).pack(fill=tk.X)
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+
+        # --- Section: 再生間隔 ---
+        self._museum_section_header(content, "再生間隔").pack(anchor='w', pady=(0, 8))
+
+        interval_row = tk.Frame(content, bg=MUSEUM_BG_BASE)
+        interval_row.pack(fill=tk.X, pady=(0, 4))
+
         self.interval_var = tk.StringVar(value="5")
-        interval_frame = tk.Frame(self.menu_frame, bg='#333333')
-        interval_frame.pack(pady=5)
-        tk.Label(interval_frame, text="自動送り間隔 (秒):", fg='white', bg='#333333').pack(side=tk.LEFT)
-        tk.Entry(interval_frame, textvariable=self.interval_var, width=5).pack(side=tk.LEFT, padx=5)
+        self._museum_entry(interval_row, self.interval_var, width=6).pack(side=tk.LEFT, ipady=6)
+        self._museum_label(interval_row, "秒", fg=MUSEUM_FG_SECONDARY).pack(side=tk.LEFT, padx=(10, 0))
 
-        # 監視設定 (起動時のデフォルト値)。再生中の操作パネルとは分離してある。
-        watch_frame = tk.Frame(self.menu_frame, bg='#333333')
-        watch_frame.pack(pady=5)
+        # 区切り
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+        self._museum_separator(content).pack(fill=tk.X)
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+
+        # --- Section: フォルダ監視 ---
+        self._museum_section_header(content, "フォルダ監視").pack(anchor='w', pady=(0, 8))
+
+        # 自動監視チェック (Checkbutton をカスタムスタイル)
+        watch_row1 = tk.Frame(content, bg=MUSEUM_BG_BASE)
+        watch_row1.pack(fill=tk.X, pady=(0, 8))
+
+        self._museum_label(watch_row1, "自動監視", width=12).pack(side=tk.LEFT)
         tk.Checkbutton(
-            watch_frame,
-            text="自動監視を有効にする",
+            watch_row1,
+            text="有効にする",
             variable=self.polling_enabled_setting_var,
-            fg='white',
-            bg='#333333',
-            selectcolor='#222222',
-            activebackground='#333333',
-            activeforeground='white',
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(watch_frame, text="監視間隔 (ms):", fg='white', bg='#333333').pack(side=tk.LEFT)
-        tk.Entry(
-            watch_frame,
-            textvariable=self.poll_interval_setting_var,
-            width=6,
-        ).pack(side=tk.LEFT, padx=5)
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_PRIMARY,
+            selectcolor=MUSEUM_BG_INPUT,
+            activebackground=MUSEUM_BG_BASE,
+            activeforeground=MUSEUM_ACCENT,
+            font=MUSEUM_FONT_BODY,
+            bd=0,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT)
+
+        watch_row2 = tk.Frame(content, bg=MUSEUM_BG_BASE)
+        watch_row2.pack(fill=tk.X, pady=(0, 4))
+
+        self._museum_label(watch_row2, "監視間隔", width=12).pack(side=tk.LEFT)
+        self._museum_entry(watch_row2, self.poll_interval_setting_var, width=8).pack(side=tk.LEFT, ipady=6)
+        self._museum_label(watch_row2, "ms", fg=MUSEUM_FG_SECONDARY).pack(side=tk.LEFT, padx=(10, 0))
+
         tk.Label(
-            self.menu_frame,
-            text=f"  ※ 範囲 {POLL_INTERVAL_MIN_MS}〜{POLL_INTERVAL_MAX_MS} ms。実検知レイテンシは目安 2 × 監視間隔。",
-            fg='#888888',
-            bg='#333333',
-            justify=tk.LEFT,
-        ).pack(pady=(0, 5))
+            content,
+            text=f"範囲 {POLL_INTERVAL_MIN_MS}〜{POLL_INTERVAL_MAX_MS} ms / 実検知レイテンシ = 2 × 監視間隔",
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_DISABLED,
+            font=MUSEUM_FONT_HELP,
+            anchor='w',
+        ).pack(anchor='w', pady=(6, 0))
 
-        tk.Button(self.menu_frame, text="2. スライドショー開始", command=self.start_slideshow, width=20, bg='#4CAF50', fg='white').pack(pady=20)
+        # 区切り
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=40).pack()
 
-        # 操作説明
-        help_text = "【操作方法】\n・Escキー: フルスクリーン切替\n・→ / Space: 次の画像\n・←: 前の画像\n・P: 再生/一時停止\n・中央タップ: 操作パネル表示\n・操作パネル: 設定画面へ戻る / 最大化切替 / フォルダ変更 / 終了\n・操作パネル: 監視ON/OFF / 即時チェック (新規画像を手動で取り込む)"
-        tk.Label(self.menu_frame, text=help_text, fg='#AAAAAA', bg='#333333', justify=tk.LEFT).pack(pady=10)
+        # --- Start button (primary action) ---
+        start_button = tk.Button(
+            content,
+            text="開  始",
+            command=self.start_slideshow,
+            bg=MUSEUM_ACCENT,
+            fg=MUSEUM_BG_BASE,
+            activebackground=MUSEUM_ACCENT_HOVER,
+            activeforeground=MUSEUM_BG_BASE,
+            relief=tk.FLAT,
+            bd=0,
+            padx=48,
+            pady=14,
+            font=MUSEUM_FONT_BUTTON_PRIMARY,
+            cursor='hand2',
+            highlightthickness=0,
+        )
+        start_button.pack()
+
+        # ヘルプ (フッタ的扱いで控えめ)
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=32).pack()
+        help_lines = [
+            "Esc: フルスクリーン切替    ← →: 前後の画像    Space: 次の画像    P: 一時停止",
+            "画面中央タップ: 操作パネル表示    ダブルタップ: タップ位置を中心にズームトグル",
+        ]
+        tk.Label(
+            content,
+            text="\n".join(help_lines),
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_DISABLED,
+            font=MUSEUM_FONT_HELP,
+            justify=tk.CENTER,
+        ).pack()
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -835,11 +1135,21 @@ class ImageViewerApp:
             self.interval_scale_var.set(interval_seconds)
 
     def update_play_pause_button(self):
-        """再生状態に合わせてボタン表示を更新"""
+        """再生状態に合わせて Museum スタイルの primary ボタン表示を更新。"""
         if self.is_playing:
-            self.play_pause_button.config(text="一時停止", bg='#4CAF50')
+            # 再生中は「一時停止」操作を見せる (primary accent)
+            self.play_pause_button.config(
+                text="一時停止",
+                bg=MUSEUM_ACCENT, fg=MUSEUM_BG_BASE,
+                activebackground=MUSEUM_ACCENT_HOVER, activeforeground=MUSEUM_BG_BASE,
+            )
         else:
-            self.play_pause_button.config(text="再開", bg='#FF9800')
+            # 停止中は「再開」を控えめに (subtle / status 寄り)
+            self.play_pause_button.config(
+                text="再 開",
+                bg=MUSEUM_BG_SURFACE, fg=MUSEUM_ACCENT,
+                activebackground=MUSEUM_BG_HOVER, activeforeground=MUSEUM_ACCENT_HOVER,
+            )
 
     def update_fullscreen_button(self):
         """フルスクリーン状態に合わせてボタン表示を更新"""
@@ -849,28 +1159,49 @@ class ImageViewerApp:
             self.fullscreen_button.config(text="最大化")
 
     def update_thumbnail_buttons(self):
-        """サムネイル関連ボタン表示を更新"""
+        """サムネイルトグルボタン表示を更新 (状態ドット式)。"""
         if self.thumbnail_visible:
-            self.thumbnail_toggle_button.config(text="サムネイル非表示")
+            # アクティブ表示: アクセント色に
+            self.thumbnail_toggle_button.config(
+                text="サムネ ●",
+                fg=MUSEUM_ACCENT, activeforeground=MUSEUM_ACCENT_HOVER,
+            )
         else:
-            self.thumbnail_toggle_button.config(text="サムネイル表示")
+            self.thumbnail_toggle_button.config(
+                text="サムネ ○",
+                fg=MUSEUM_FG_PRIMARY, activeforeground=MUSEUM_FG_PRIMARY,
+            )
 
     def update_metadata_button(self):
-        """情報欄トグルボタン表示を更新"""
+        """情報欄トグルボタン表示を更新 (状態ドット式)。"""
         if self.metadata_visible:
-            self.metadata_toggle_button.config(text="情報欄非表示")
+            self.metadata_toggle_button.config(
+                text="情報 ●",
+                fg=MUSEUM_ACCENT, activeforeground=MUSEUM_ACCENT_HOVER,
+            )
         else:
-            self.metadata_toggle_button.config(text="情報欄表示")
+            self.metadata_toggle_button.config(
+                text="情報 ○",
+                fg=MUSEUM_FG_PRIMARY, activeforeground=MUSEUM_FG_PRIMARY,
+            )
 
     def update_polling_status_ui(self):
-        """監視 ON/OFF トグルボタンの表示を現在状態に合わせる"""
+        """監視 ON/OFF トグルボタンを Museum 状態ドット表示で更新。"""
         button = getattr(self, "polling_toggle_button", None)
         if button is None:
             return
         if self.polling_enabled:
-            button.config(text="監視ON", bg='#4CAF50', fg='white')
+            # ON = 緑のドット (status_ok)
+            button.config(
+                text="監視 ●",
+                fg=MUSEUM_STATUS_OK, activeforeground=MUSEUM_STATUS_OK,
+            )
         else:
-            button.config(text="監視OFF", bg='#FF9800', fg='white')
+            # OFF = 灰色のドット (muted)
+            button.config(
+                text="監視 ○",
+                fg=MUSEUM_FG_SECONDARY, activeforeground=MUSEUM_FG_PRIMARY,
+            )
 
     def toggle_polling(self):
         """再生中の監視 ON/OFF を切り替える"""
@@ -1667,8 +1998,8 @@ finally {{
         return thumb_photo
 
     def add_thumbnail_item(self, index, image_path):
-        """サムネイル帯へ 1 件だけ追加する"""
-        item_frame = tk.Frame(self.thumbnail_inner, bg='#161616', padx=4, pady=4)
+        """サムネイル帯へ 1 件だけ追加する (Museum スタイル)。"""
+        item_frame = tk.Frame(self.thumbnail_inner, bg=MUSEUM_BG_SURFACE, padx=4, pady=4)
         item_frame.pack(side=tk.LEFT)
 
         button = tk.Button(
@@ -1678,8 +2009,10 @@ finally {{
             height=100,
             bd=2,
             relief=tk.FLAT,
-            bg='#222222',
-            activebackground='#444444',
+            bg=MUSEUM_BG_HOVER,
+            activebackground=MUSEUM_BG_HOVER,
+            highlightthickness=0,
+            cursor='hand2',
             command=lambda i=index: self.select_image_from_thumbnail(i)
         )
         button.pack()
@@ -1687,8 +2020,9 @@ finally {{
         label = tk.Label(
             item_frame,
             text=str(index + 1),
-            bg='#161616',
-            fg='white'
+            bg=MUSEUM_BG_SURFACE,
+            fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_NUMBER,
         )
         label.pack(pady=(4, 0))
 
@@ -1802,10 +2136,26 @@ finally {{
             return
 
         for image_path, button in self.thumbnail_buttons.items():
+            label = self.thumbnail_labels.get(image_path)
             if image_path == current_path:
-                button.config(relief=tk.SOLID, bg='#4CAF50', highlightbackground='#4CAF50')
+                # 現在画像: アクセント色枠 + 番号も accent
+                button.config(
+                    relief=tk.SOLID,
+                    bg=MUSEUM_BG_HOVER,
+                    highlightbackground=MUSEUM_ACCENT,
+                    highlightthickness=2,
+                )
+                if label is not None:
+                    label.config(fg=MUSEUM_ACCENT)
             else:
-                button.config(relief=tk.FLAT, bg='#222222', highlightbackground='#222222')
+                button.config(
+                    relief=tk.FLAT,
+                    bg=MUSEUM_BG_HOVER,
+                    highlightbackground=MUSEUM_BG_SURFACE,
+                    highlightthickness=0,
+                )
+                if label is not None:
+                    label.config(fg=MUSEUM_FG_SECONDARY)
 
         self.schedule_thumbnail_follow(current_path)
 
@@ -2072,6 +2422,8 @@ finally {{
 
             if self.seekbar_var.get() != self.current_index + 1:
                 self.seekbar_var.set(self.current_index + 1)
+            # 「23 / 1247」表示 (Museum スタイル)
+            self.update_seekbar_index_label()
 
             if refresh_metadata:
                 self.schedule_metadata_refresh(image_path=image_path)
@@ -2683,6 +3035,20 @@ finally {{
         """画像リストの長さに合わせてシークバーの最大値を更新"""
         max_value = max(1, len(self.image_list))
         self.seekbar.config(to=max_value, state=tk.NORMAL if self.image_list else tk.DISABLED)
+        self.update_seekbar_index_label()
+
+    def update_seekbar_index_label(self):
+        """「23 / 1247」形式の index 表示を現在状態に同期する (Museum 表示)。"""
+        var = getattr(self, "seekbar_index_var", None)
+        if var is None:
+            return
+        total = len(self.image_list)
+        if total == 0:
+            var.set("—")
+        elif 0 <= self.current_index < total:
+            var.set(f"{self.current_index + 1} / {total}")
+        else:
+            var.set(f"— / {total}")
 
     def on_press(self, event):
         """マウス/タッチの押下開始"""
