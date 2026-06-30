@@ -346,9 +346,9 @@ def _trash_linux(abs_path):
 class ImageViewerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Art Viewer")
-        self.root.geometry("720x680")
-        self.root.minsize(560, 480)
+        self.root.title("autoviewer")
+        self.root.geometry("680x620")
+        self.root.minsize(540, 460)
         self.root.configure(bg=MUSEUM_BG_BASE)
 
         # アプリの状態変数
@@ -387,6 +387,10 @@ class ImageViewerApp:
         # 単一タップとダブルタップ区別用 (1x 表示時の単一タップを後追い実行する仕組み)
         self.pending_single_tap_id = None  # after() 予約 ID
         self.pending_single_tap_event = None  # 遅延実行する単一タップのイベント情報
+
+        # 操作パネルの折りたたみ状態。デフォルトは compact (鑑賞の邪魔にならない)。
+        # 詳細ボタンで True ↔ False を切り替え、expanded zone を pack/unpack する。
+        self.panel_expanded = False
         # ダブルタップ検出用に「直前のタップ release 時刻 + 位置」を保持する。
         # Tk の <Double-Button-1> は第 2 タップの押下時に発火するため「タップ + 即スワイプ」
         # の swipe を取りこぼす。代わりに release 時刻ベースで自前検出する。
@@ -725,23 +729,53 @@ class ImageViewerApp:
     def _build_operation_panel(self, parent):
         """Museum テーマの操作パネル本体を組み立てる。
 
-        ゾーン構成 (上から):
-          1. SEEKBAR (シーク + index + interval)
-          2. PLAYBACK (一時停止 / 前 / 次 / 最大化)
-          3. VIEW & FILE (サムネ・情報・監視・チェック・削除 / コピー・ファイラ・フォルダ)
-          4. ZOOM & INTERVAL (スライダー類)
-          5. EXIT (設定戻る・終了・閉じる、右寄せ)
+        構造:
+          compact zone (常時表示) — 鑑賞中に出しっぱなしでも邪魔にならない最小構成
+            - SEEKBAR + index + interval status
+            - ⏸/再開 + ◀ + ▶ + 詳細トグル + ✕ 閉じる
+          expanded zone (toggle_panel_expand で出現)
+            - VIEW (サムネ / 情報 / 監視 / 即時)
+            - FILE (削除 / コピー / ファイラ / フォルダ変更)
+            - ZOOM + INTERVAL スライダー
+            - EXIT (最大化 / 設定画面へ戻る / 終了)
         """
-        pad_x = 20
-        pad_y_zone = 12
+        # 縮減された余白 (compact 優先)
+        pad_x = 14
+        pad_y = 8
 
-        # === Zone 1: SEEKBAR ====================================================
-        seek_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
-        seek_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, 6))
+        # === Compact zone (常時表示) ============================================
+        compact_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        compact_zone.pack(fill=tk.X, padx=pad_x, pady=pad_y)
+
+        # 1 行目: index + seekbar + interval
+        seek_row = tk.Frame(compact_zone, bg=MUSEUM_BG_BASE)
+        seek_row.pack(fill=tk.X)
+
+        self.seekbar_index_var = tk.StringVar(value="—")
+        tk.Label(
+            seek_row,
+            textvariable=self.seekbar_index_var,
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_PRIMARY,
+            font=MUSEUM_FONT_NUMBER,
+            anchor='w',
+            width=12,
+        ).pack(side=tk.LEFT)
+
+        self.interval_status_var = tk.StringVar()
+        tk.Label(
+            seek_row,
+            textvariable=self.interval_status_var,
+            bg=MUSEUM_BG_BASE,
+            fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_NUMBER,
+            anchor='e',
+            width=12,
+        ).pack(side=tk.RIGHT)
 
         self.seekbar_var = tk.IntVar()
         self.seekbar = tk.Scale(
-            seek_zone,
+            seek_row,
             variable=self.seekbar_var,
             orient=tk.HORIZONTAL,
             showvalue=False,
@@ -752,135 +786,127 @@ class ImageViewerApp:
             highlightthickness=0,
             bd=0,
             sliderrelief=tk.FLAT,
-            sliderlength=24,
+            sliderlength=20,
             command=self.on_seek,
         )
-        self.seekbar.pack(fill=tk.X, side=tk.TOP)
+        self.seekbar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
-        meta_row = tk.Frame(seek_zone, bg=MUSEUM_BG_BASE)
-        meta_row.pack(fill=tk.X, pady=(2, 0))
-
-        # 左: index 表示 (mono、 23 / 1247 形式)
-        self.seekbar_index_var = tk.StringVar(value="—")
-        tk.Label(
-            meta_row,
-            textvariable=self.seekbar_index_var,
-            bg=MUSEUM_BG_BASE,
-            fg=MUSEUM_FG_PRIMARY,
-            font=MUSEUM_FONT_NUMBER_LARGE,
-        ).pack(side=tk.LEFT)
-
-        # 右: interval status (mono、5.0 SEC 形式)
-        self.interval_status_var = tk.StringVar()
-        tk.Label(
-            meta_row,
-            textvariable=self.interval_status_var,
-            bg=MUSEUM_BG_BASE,
-            fg=MUSEUM_FG_SECONDARY,
-            font=MUSEUM_FONT_NUMBER,
-        ).pack(side=tk.RIGHT)
-
-        # 区切り線
-        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X, pady=(pad_y_zone, 0))
-
-        # === Zone 2: PLAYBACK ===================================================
-        playback_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
-        playback_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
-
-        self._museum_section_header(playback_zone, "PLAYBACK").pack(anchor='w', pady=(0, 6))
-
-        playback_buttons = tk.Frame(playback_zone, bg=MUSEUM_BG_BASE)
-        playback_buttons.pack(anchor='w')
+        # 2 行目: 再生制御 + 詳細トグル + 閉じる
+        ctrl_row = tk.Frame(compact_zone, bg=MUSEUM_BG_BASE)
+        ctrl_row.pack(fill=tk.X, pady=(6, 0))
 
         self.play_pause_button = self._museum_button(
-            playback_buttons, "一時停止", self.toggle_play, variant='primary', width=10,
+            ctrl_row, "⏸ 停止", self.toggle_play, variant='primary', width=8,
         )
-        self.play_pause_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.play_pause_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self._museum_button(
-            playback_buttons, "前へ", self.prev_image, variant='default', width=8,
-        ).pack(side=tk.LEFT, padx=(0, 8))
+            ctrl_row, "◀  前", self.prev_image, variant='default', width=6,
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
         self._museum_button(
-            playback_buttons, "次へ", self.next_image, variant='default', width=8,
-        ).pack(side=tk.LEFT, padx=(0, 8))
+            ctrl_row, "次  ▶", self.next_image, variant='default', width=6,
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
-        self.fullscreen_button = self._museum_button(
-            playback_buttons, "最大化解除", self.toggle_fullscreen_mode, variant='default', width=10,
+        # 右側: 閉じる + 詳細トグル
+        self.close_panel_button = self._museum_button(
+            ctrl_row, "✕ 閉じる", self.toggle_seekbar, variant='subtle', width=8,
         )
-        self.fullscreen_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.close_panel_button.pack(side=tk.RIGHT)
 
-        # 区切り線
-        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X)
+        self.expand_toggle_button = self._museum_button(
+            ctrl_row, "詳細 ▼", self.toggle_panel_expand, variant='subtle', width=7,
+        )
+        self.expand_toggle_button.pack(side=tk.RIGHT, padx=(0, 6))
 
-        # === Zone 3: VIEW + FILE ================================================
-        viewfile_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
-        viewfile_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
+        # === Expanded zone (toggle で出現) ======================================
+        # 区切り線は expand 時に出す。常時は隠す。
+        self.expand_separator = self._museum_separator(parent, indent=pad_x)
 
-        # 表示トグル列
-        self._museum_section_header(viewfile_zone, "VIEW").pack(anchor='w', pady=(0, 6))
-        view_buttons = tk.Frame(viewfile_zone, bg=MUSEUM_BG_BASE)
-        view_buttons.pack(anchor='w', pady=(0, 10))
+        self.expanded_panel = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        # ここではまだ pack しない (compact デフォルト)。toggle_panel_expand が pack する。
+
+        self._build_expanded_panel(self.expanded_panel, pad_x, pad_y)
+
+    def _build_expanded_panel(self, container, pad_x, pad_y):
+        """詳細展開時のみ見える追加コントロール群を組み立てる。"""
+
+        # --- VIEW 行 ---
+        view_zone = tk.Frame(container, bg=MUSEUM_BG_BASE)
+        view_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y, 4))
+
+        tk.Label(
+            view_zone, text="VIEW",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_SECTION, width=10, anchor='w',
+        ).pack(side=tk.LEFT)
+
+        view_buttons = tk.Frame(view_zone, bg=MUSEUM_BG_BASE)
+        view_buttons.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.thumbnail_toggle_button = self._museum_button(
-            view_buttons, "サムネ ○", self.toggle_thumbnail_panel, variant='default', width=10,
+            view_buttons, "サムネ ○", self.toggle_thumbnail_panel, variant='default', width=9,
         )
-        self.thumbnail_toggle_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.thumbnail_toggle_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self.metadata_toggle_button = self._museum_button(
-            view_buttons, "情報 ○", self.toggle_metadata_panel, variant='default', width=10,
+            view_buttons, "情報 ○", self.toggle_metadata_panel, variant='default', width=9,
         )
-        self.metadata_toggle_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.metadata_toggle_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self.polling_toggle_button = self._museum_button(
-            view_buttons, "監視 ●", self.toggle_polling, variant='status', width=10,
+            view_buttons, "監視 ●", self.toggle_polling, variant='status', width=9,
         )
-        self.polling_toggle_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.polling_toggle_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self.manual_check_button = self._museum_button(
-            view_buttons, "即時チェック", self.request_manual_check, variant='default', width=12,
+            view_buttons, "即時チェック", self.request_manual_check, variant='default', width=11,
         )
         self.manual_check_button.pack(side=tk.LEFT)
 
-        # ファイル操作列
-        self._museum_section_header(viewfile_zone, "FILE").pack(anchor='w', pady=(0, 6))
-        file_buttons = tk.Frame(viewfile_zone, bg=MUSEUM_BG_BASE)
-        file_buttons.pack(anchor='w')
+        # --- FILE 行 ---
+        file_zone = tk.Frame(container, bg=MUSEUM_BG_BASE)
+        file_zone.pack(fill=tk.X, padx=pad_x, pady=(0, pad_y))
+
+        tk.Label(
+            file_zone, text="FILE",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_SECONDARY,
+            font=MUSEUM_FONT_SECTION, width=10, anchor='w',
+        ).pack(side=tk.LEFT)
+
+        file_buttons = tk.Frame(file_zone, bg=MUSEUM_BG_BASE)
+        file_buttons.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.delete_button = self._museum_button(
-            file_buttons, "削除", self.delete_current_image, variant='danger', width=8,
+            file_buttons, "削除", self.delete_current_image, variant='danger', width=7,
             state=tk.DISABLED,
         )
-        self.delete_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.delete_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self.copy_button = self._museum_button(
             file_buttons, "コピー", self.copy_current_image_to_clipboard,
-            variant='default', width=8, state=tk.DISABLED,
+            variant='default', width=7, state=tk.DISABLED,
         )
-        self.copy_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.copy_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self.reveal_button = self._museum_button(
-            file_buttons, "ファイラで表示", self.reveal_current_image_in_file_manager,
-            variant='default', width=14, state=tk.DISABLED,
+            file_buttons, "ファイラ", self.reveal_current_image_in_file_manager,
+            variant='default', width=9, state=tk.DISABLED,
         )
-        self.reveal_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.reveal_button.pack(side=tk.LEFT, padx=(0, 6))
 
         self.change_folder_button = self._museum_button(
             file_buttons, "フォルダ変更", self.change_folder_during_slideshow,
-            variant='default', width=12,
+            variant='default', width=11,
         )
         self.change_folder_button.pack(side=tk.LEFT)
 
         # 区切り線
-        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X)
+        self._museum_separator(container, indent=pad_x).pack(fill=tk.X, pady=(2, 0))
 
-        # === Zone 4: ZOOM + INTERVAL スライダー =================================
-        sliders_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
-        sliders_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
-
-        # ZOOM 行
-        zoom_row = tk.Frame(sliders_zone, bg=MUSEUM_BG_BASE)
-        zoom_row.pack(fill=tk.X, pady=(0, 10))
+        # --- ZOOM 行 ---
+        zoom_row = tk.Frame(container, bg=MUSEUM_BG_BASE)
+        zoom_row.pack(fill=tk.X, padx=pad_x, pady=(pad_y, 4))
 
         tk.Label(
             zoom_row, text="ZOOM",
@@ -903,27 +929,27 @@ class ImageViewerApp:
             highlightthickness=0,
             bd=0,
             sliderrelief=tk.FLAT,
-            sliderlength=24,
-            length=240,
+            sliderlength=20,
+            length=200,
             command=self.on_zoom_slider_change,
         )
-        self.zoom_scale.pack(side=tk.LEFT, padx=(8, 8))
+        self.zoom_scale.pack(side=tk.LEFT, padx=(0, 6))
 
         self.zoom_label_var = tk.StringVar(value="1.0x")
         tk.Label(
             zoom_row, textvariable=self.zoom_label_var,
             bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_PRIMARY,
-            font=MUSEUM_FONT_NUMBER_LARGE, width=6,
+            font=MUSEUM_FONT_NUMBER, width=5,
         ).pack(side=tk.LEFT)
 
         self.zoom_reset_button = self._museum_button(
-            zoom_row, "リセット", self.reset_zoom, variant='subtle', width=8,
+            zoom_row, "リセット", self.reset_zoom, variant='subtle', width=7,
         )
         self.zoom_reset_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        # INTERVAL 行
-        interval_row = tk.Frame(sliders_zone, bg=MUSEUM_BG_BASE)
-        interval_row.pack(fill=tk.X)
+        # --- INTERVAL 行 ---
+        interval_row = tk.Frame(container, bg=MUSEUM_BG_BASE)
+        interval_row.pack(fill=tk.X, padx=pad_x, pady=(0, pad_y))
 
         tk.Label(
             interval_row, text="INTERVAL",
@@ -946,50 +972,65 @@ class ImageViewerApp:
             highlightthickness=0,
             bd=0,
             sliderrelief=tk.FLAT,
-            sliderlength=24,
-            length=240,
+            sliderlength=20,
+            length=200,
             command=self.on_interval_change,
         )
-        self.interval_scale.pack(side=tk.LEFT, padx=(8, 8))
+        self.interval_scale.pack(side=tk.LEFT, padx=(0, 6))
 
         # 区切り線
-        self._museum_separator(parent, indent=pad_x).pack(fill=tk.X)
+        self._museum_separator(container, indent=pad_x).pack(fill=tk.X, pady=(2, 0))
 
-        # === Zone 5: EXIT (右寄せ) ==============================================
-        exit_zone = tk.Frame(parent, bg=MUSEUM_BG_BASE)
-        exit_zone.pack(fill=tk.X, padx=pad_x, pady=(pad_y_zone, pad_y_zone))
+        # --- EXIT 行 (右寄せ) ---
+        exit_row = tk.Frame(container, bg=MUSEUM_BG_BASE)
+        exit_row.pack(fill=tk.X, padx=pad_x, pady=(pad_y, pad_y))
 
-        self.close_panel_button = self._museum_button(
-            exit_zone, "閉じる", self.toggle_seekbar, variant='subtle', width=8,
+        self.fullscreen_button = self._museum_button(
+            exit_row, "最大化解除", self.toggle_fullscreen_mode, variant='subtle', width=10,
         )
-        self.close_panel_button.pack(side=tk.RIGHT)
+        self.fullscreen_button.pack(side=tk.LEFT)
 
         self.quit_button = self._museum_button(
-            exit_zone, "終了", self.on_closing, variant='subtle', width=8,
+            exit_row, "終了", self.on_closing, variant='subtle', width=7,
         )
-        self.quit_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self.quit_button.pack(side=tk.RIGHT)
 
         self.return_to_menu_button = self._museum_button(
-            exit_zone, "設定画面へ戻る", self.return_to_menu, variant='subtle', width=14,
+            exit_row, "設定画面へ戻る", self.return_to_menu, variant='subtle', width=13,
         )
-        self.return_to_menu_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self.return_to_menu_button.pack(side=tk.RIGHT, padx=(0, 6))
+
+    def toggle_panel_expand(self):
+        """操作パネルの compact / expanded 切替。"""
+        self.panel_expanded = not self.panel_expanded
+        if self.panel_expanded:
+            self.expand_separator.pack(fill=tk.X)
+            self.expanded_panel.pack(fill=tk.X)
+            self.expand_toggle_button.config(text="詳細 ▲")
+        else:
+            self.expand_separator.pack_forget()
+            self.expanded_panel.pack_forget()
+            self.expand_toggle_button.config(text="詳細 ▼")
 
     def _build_settings_screen(self, parent):
         """Museum テーマの起動 / 設定画面を組み立てる。"""
-        # ディスプレイ幅の調整 (中央寄せ + 一定幅)
+        # ディスプレイ幅の調整 (中央寄せ + 一定幅)。鑑賞中は表示されないので
+        # 操作パネルほど詰めなくてよいが、余白を持たせすぎないバランスに。
         content = tk.Frame(parent, bg=MUSEUM_BG_BASE)
-        content.pack(padx=48, pady=40)
+        content.pack(padx=40, pady=28)
 
         # --- Title ---
+        # リポジトリ名 / 実行ファイル名と一致した小文字表記。letter-spacing 感を
+        # 出すためにスペース区切り。
         tk.Label(
-            content, text="A R T   V I E W E R",
+            content, text="a u t o v i e w e r",
             bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_PRIMARY,
             font=MUSEUM_FONT_DISPLAY,
         ).pack(pady=(0, 4))
 
         # タイトル下の細いアクセント線
         accent_underline = tk.Frame(content, bg=MUSEUM_ACCENT, height=2, width=120)
-        accent_underline.pack(pady=(0, 36))
+        accent_underline.pack(pady=(0, 28))
         accent_underline.pack_propagate(False)
 
         # --- Section: 監視対象フォルダ ---
@@ -1015,9 +1056,9 @@ class ImageViewerApp:
         ).pack(side=tk.LEFT, padx=(8, 0))
 
         # 区切り
-        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=18).pack()
         self._museum_separator(content).pack(fill=tk.X)
-        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=18).pack()
 
         # --- Section: 再生間隔 ---
         self._museum_section_header(content, "再生間隔").pack(anchor='w', pady=(0, 8))
@@ -1030,9 +1071,9 @@ class ImageViewerApp:
         self._museum_label(interval_row, "秒", fg=MUSEUM_FG_SECONDARY).pack(side=tk.LEFT, padx=(10, 0))
 
         # 区切り
-        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=18).pack()
         self._museum_separator(content).pack(fill=tk.X)
-        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=18).pack()
 
         # --- Section: フォルダ監視 ---
         self._museum_section_header(content, "フォルダ監視").pack(anchor='w', pady=(0, 8))
@@ -1073,7 +1114,7 @@ class ImageViewerApp:
         ).pack(anchor='w', pady=(6, 0))
 
         # 区切り
-        tk.Frame(content, bg=MUSEUM_BG_BASE, height=40).pack()
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=28).pack()
 
         # --- Start button (primary action) ---
         start_button = tk.Button(
@@ -1086,8 +1127,8 @@ class ImageViewerApp:
             activeforeground=MUSEUM_BG_BASE,
             relief=tk.FLAT,
             bd=0,
-            padx=48,
-            pady=14,
+            padx=44,
+            pady=12,
             font=MUSEUM_FONT_BUTTON_PRIMARY,
             cursor='hand2',
             highlightthickness=0,
@@ -1095,7 +1136,7 @@ class ImageViewerApp:
         start_button.pack()
 
         # ヘルプ (フッタ的扱いで控えめ)
-        tk.Frame(content, bg=MUSEUM_BG_BASE, height=32).pack()
+        tk.Frame(content, bg=MUSEUM_BG_BASE, height=24).pack()
         help_lines = [
             "Esc: フルスクリーン切替    ← →: 前後の画像    Space: 次の画像    P: 一時停止",
             "画面中央タップ: 操作パネル表示    ダブルタップ: タップ位置を中心にズームトグル",
