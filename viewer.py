@@ -808,6 +808,12 @@ class ImageViewerApp:
             ctrl_row, "次  ▶", self.next_image, variant='default', width=6,
         ).pack(side=tk.LEFT, padx=(0, 6))
 
+        # 最大化解除は頻繁に使うため compact 側に置く
+        self.fullscreen_button = self._museum_button(
+            ctrl_row, "最大化解除", self.toggle_fullscreen_mode, variant='default', width=10,
+        )
+        self.fullscreen_button.pack(side=tk.LEFT, padx=(0, 6))
+
         # 右側: 閉じる + 詳細トグル
         self.close_panel_button = self._museum_button(
             ctrl_row, "✕ 閉じる", self.toggle_seekbar, variant='subtle', width=8,
@@ -877,12 +883,7 @@ class ImageViewerApp:
         file_buttons = tk.Frame(file_zone, bg=MUSEUM_BG_BASE)
         file_buttons.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.delete_button = self._museum_button(
-            file_buttons, "削除", self.delete_current_image, variant='danger', width=7,
-            state=tk.DISABLED,
-        )
-        self.delete_button.pack(side=tk.LEFT, padx=(0, 6))
-
+        # 非破壊操作グループ (左寄せ)
         self.copy_button = self._museum_button(
             file_buttons, "コピー", self.copy_current_image_to_clipboard,
             variant='default', width=7, state=tk.DISABLED,
@@ -900,6 +901,14 @@ class ImageViewerApp:
             variant='default', width=11,
         )
         self.change_folder_button.pack(side=tk.LEFT)
+
+        # 削除は破壊的なので他のボタン群から物理的に離して右端に配置。
+        # 一時停止中のみ enable される (update_delete_button_state 参照)。
+        self.delete_button = self._museum_button(
+            file_buttons, "削除", self.delete_current_image, variant='danger', width=7,
+            state=tk.DISABLED,
+        )
+        self.delete_button.pack(side=tk.RIGHT, padx=(20, 0))
 
         # 区切り線
         self._museum_separator(container, indent=pad_x).pack(fill=tk.X, pady=(2, 0))
@@ -978,17 +987,23 @@ class ImageViewerApp:
         )
         self.interval_scale.pack(side=tk.LEFT, padx=(0, 6))
 
+        # ZOOM スライダーと同じレイアウトで現在値を右隣に表示。
+        # compact zone (seek_row) 側にも自動送り表示があるが意図的に重複させて
+        # 操作中に視線移動を最小化する。
+        self.interval_label_var = tk.StringVar(value="5.0s")
+        tk.Label(
+            interval_row, textvariable=self.interval_label_var,
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_PRIMARY,
+            font=MUSEUM_FONT_NUMBER, width=5,
+        ).pack(side=tk.LEFT)
+
         # 区切り線
         self._museum_separator(container, indent=pad_x).pack(fill=tk.X, pady=(2, 0))
 
         # --- EXIT 行 (右寄せ) ---
+        # 最大化解除は compact zone に昇格したので、ここからは外す。
         exit_row = tk.Frame(container, bg=MUSEUM_BG_BASE)
         exit_row.pack(fill=tk.X, padx=pad_x, pady=(pad_y, pad_y))
-
-        self.fullscreen_button = self._museum_button(
-            exit_row, "最大化解除", self.toggle_fullscreen_mode, variant='subtle', width=10,
-        )
-        self.fullscreen_button.pack(side=tk.LEFT)
 
         self.quit_button = self._museum_button(
             exit_row, "終了", self.on_closing, variant='subtle', width=7,
@@ -1172,6 +1187,9 @@ class ImageViewerApp:
         formatted = self.format_interval_seconds(interval_seconds)
         self.interval_var.set(formatted)
         self.interval_status_var.set(f"自動送り: {formatted}秒")
+        # 詳細展開時の INTERVAL スライダー右隣 readout (ZOOM スライダーと同じ形式)
+        if hasattr(self, "interval_label_var"):
+            self.interval_label_var.set(f"{formatted}s")
         if abs(self.interval_scale_var.get() - interval_seconds) > 0.001:
             self.interval_scale_var.set(interval_seconds)
 
