@@ -150,6 +150,10 @@ python viewer.py --debug resize,timeline,hud
 
 ## **更新履歴**
 
+* **v1.14**  
+  * 【修正】JPEG 等の EXIF 情報表示で mojibake が大量に出る問題を修正。原因は `image.info["exif"]` (生 TIFF ブロック) を通常テキストとして表示していたこと、UserComment の charset prefix (`UNICODE\0\0` / `ASCII\0\0\0` / `JIS`) を無視していたこと、utf-16 が偶数バイト長の任意バイナリを (エラーなしで) gibberish として返す問題を検出できていなかったこと。
+  * 【機能追加】拡張 EXIF (Exif IFD / GPS IFD / Interop IFD) をタグ名付きで展開表示するように。DateTimeOriginal、LensModel、GPS 座標などが表示されるようになりました。
+  * 【機能追加】MakerNote などのベンダー独自バイナリは中身を展開せず `<N バイトのバイナリ>` として要約表示。
 * **v1.13**  
   * 【UI 刷新】起動画面と再生中の操作パネルを「Museum」テーマに再設計。黒地キャンバスに **タングステン色 (#D4A574)** をアクセントとして用いる、暗室の美術館をイメージしたダークテーマ。
   * 起動画面: `a u t o v i e w e r` の Georgia セリフタイトル + 区切り線でセクション分け。
