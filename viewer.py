@@ -100,6 +100,187 @@ IMAGE_OPEN_RETRY_DELAY_MS = 500
 IMAGE_OPEN_MAX_ATTEMPTS = 3
 METADATA_CACHE_MAX_ITEMS = 256
 
+# image.info のうち、生 EXIF ブロックや ICC プロファイル等の「バイナリを
+# そのまま人間向けに出しても意味が無い」キーは display から除外する。
+# EXIF は getexif() + get_ifd() で構造化して別途表示される。
+METADATA_INFO_SKIP_KEYS = frozenset({
+    "exif",          # 生 TIFF/EXIF ブロック
+    "icc_profile",   # ICC プロファイル (大容量バイナリ)
+    "xmp",           # XMP メタデータ (XML バイナリ)
+    "photoshop",     # Adobe 独自 blob
+    "iptc",          # IPTC (IIM) 独自 blob
+})
+
+# トップレベル EXIF に含まれる「他 IFD へのポインタ」タグ。
+# これらは値ではなくオフセットが入っているだけなので、そのまま表示せず
+# get_ifd() で展開してから中身を並べる。
+EXIF_IFD_POINTERS = {
+    0x8769: "Exif IFD",       # ExifOffset (DateTimeOriginal, LensModel, UserComment 等)
+    0x8825: "GPS IFD",        # GPSInfo
+    0xA005: "Interop IFD",    # InteroperabilityIFD
+}
+
+# EXIF UserComment (tag 37510) は先頭 8 バイトが charset code。
+EXIF_USER_COMMENT_TAG = 37510
+EXIF_USER_COMMENT_CHARSETS = {
+    b"ASCII\x00\x00\x00": "ascii",
+    b"JIS\x00\x00\x00\x00\x00": "iso-2022-jp",
+    b"UNICODE\x00": "utf-16",
+    b"\x00\x00\x00\x00\x00\x00\x00\x00": None,  # undefined
+}
+
+# MakerNote はベンダー独自バイナリで、通常はデコード不能。
+EXIF_MAKER_NOTE_TAG = 37500
+
+# デコード結果が「本当に text か」判定するための printable 率閾値。
+# utf-16 は偶数バイト長の任意バイナリを (エラーなしで) gibberish に変換して
+# 返してしまうため、この閾値で除外する。
+METADATA_PRINTABLE_RATIO_MIN = 0.90
+
+# 巨大バイナリ (MakerNote / 未知の長いバイト列) は先頭 hex ダンプに要約する。
+METADATA_BINARY_SUMMARY_THRESHOLD = 4096
+
+
+def _looks_like_text(text, threshold=METADATA_PRINTABLE_RATIO_MIN):
+    """デコード後の文字列が「読めるテキスト」かどうかを大雑把に判定する。
+
+    ただし CJK 領域の mojibake (LE/BE 誤判定で発生する printable な "漢字列")
+    はここでは弾けない。UTF-16 の LE/BE 判別には _ascii_printable_ratio を
+    併用すること。
+    """
+    if not text:
+        return False
+    ok = 0
+    for ch in text:
+        code = ord(ch)
+        if ch in ("\n", "\r", "\t") or ch.isprintable():
+            # サロゲート・私用領域・noncharacter は mojibake の代表格なので除外
+            if 0xD800 <= code <= 0xDFFF:
+                continue
+            if 0xE000 <= code <= 0xF8FF:
+                continue
+            if 0xF0000 <= code <= 0xFFFFD:
+                continue
+            if 0x100000 <= code <= 0x10FFFD:
+                continue
+            if 0xFDD0 <= code <= 0xFDEF:
+                continue
+            if (code & 0xFFFF) in (0xFFFE, 0xFFFF):
+                continue
+            ok += 1
+    return ok / len(text) >= threshold
+
+
+def _ascii_printable_ratio(text):
+    """ASCII 印字領域 (0x20-0x7E) + 制御 (\\n \\r \\t) の比率。
+
+    UTF-16 の LE/BE 誤判定を見抜くのに使う。正しくデコードされた ASCII 文字列
+    (英字プロンプト等) は 1.0 に近く、逆向きで読んで生成された printable 幅の
+    CJK 領域 mojibake は 0.0 に近くなる。CJK 本文には効かない (両方低い) が、
+    英字ベースの SD プロンプトを扱う実用上は決定的な判別軸になる。
+    """
+    if not text:
+        return 0.0
+    hits = sum(1 for ch in text
+               if (0x20 <= ord(ch) <= 0x7E) or ch in ("\n", "\r", "\t"))
+    return hits / len(text)
+
+
+def _decode_user_comment(value, endian=None):
+    """EXIF UserComment を charset prefix に従ってデコード。
+
+    先頭 8 バイトが charset code (ASCII / UNICODE / JIS / undefined) で、
+    残りが本文。UNICODE の場合は EXIF 規格上 UTF-16 (byte order は BOM か
+    TIFF endian に従う)。
+
+    endian: 呼び出し側で分かっていれば ">" (BE) / "<" (LE) を渡す。
+            None なら BOM のみで判定し、無ければ両向きを strict decode して
+            ASCII 印字率が高い方を採用。両方失敗なら None を返す。
+    """
+    if not isinstance(value, bytes) or len(value) < 8:
+        return None
+    prefix = value[:8]
+    payload = value[8:]
+    codec_hint = EXIF_USER_COMMENT_CHARSETS.get(prefix)
+
+    def _try_strict_decode(codec):
+        try:
+            text = payload.decode(codec).rstrip("\x00")
+            if _looks_like_text(text):
+                return text
+        except UnicodeDecodeError:
+            return None
+        return None
+
+    if codec_hint == "utf-16":
+        # BOM 優先 (payload 内の BOM を厳密に信頼)
+        if payload.startswith(b"\xfe\xff"):
+            try:
+                text = payload[2:].decode("utf-16-be").rstrip("\x00")
+                if _looks_like_text(text):
+                    return text
+            except UnicodeDecodeError:
+                pass
+            return None
+        if payload.startswith(b"\xff\xfe"):
+            try:
+                text = payload[2:].decode("utf-16-le").rstrip("\x00")
+                if _looks_like_text(text):
+                    return text
+            except UnicodeDecodeError:
+                pass
+            return None
+        # BOM 無し: TIFF endian が判っていればそれで確定
+        if endian == ">":
+            return _try_strict_decode("utf-16-be")
+        if endian == "<":
+            return _try_strict_decode("utf-16-le")
+        # endian 不明: 両向き strict decode → ASCII 印字率で判別。
+        # SD プロンプトのような英字主体テキストは片方が 1.0 近く、逆向きで読んだ
+        # mojibake は 0.0 近くになるので分別可能。ただし日本語のみで書かれた
+        # UTF-16 のように **両向きとも ASCII 率が低い** ケースは判別不能。
+        # その場合は None を返して呼び出し側の一般 decoder / hex summary に
+        # 委ねる (誤った mojibake を確定させない)。
+        candidates = []
+        for c in ("utf-16-be", "utf-16-le"):
+            try:
+                text = payload.decode(c).rstrip("\x00")
+                if _looks_like_text(text):
+                    candidates.append((_ascii_printable_ratio(text), text))
+            except UnicodeDecodeError:
+                continue
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            # 片方だけが _looks_like_text を通った (endian 確定)
+            return candidates[0][1]
+        candidates.sort(reverse=True)
+        top_ratio, top_text = candidates[0]
+        second_ratio, _ = candidates[1]
+        # 明確な差 (ASCII 主体 vs mojibake) がある場合のみ確定
+        if top_ratio >= 0.5 and (top_ratio - second_ratio) >= 0.3:
+            return top_text
+        # 判別不能 (両方低い、または差が小さい)
+        return None
+    if codec_hint == "ascii":
+        try:
+            text = payload.decode("ascii").rstrip("\x00")
+            if _looks_like_text(text):
+                return text
+        except UnicodeDecodeError:
+            pass
+        return None
+    if codec_hint == "iso-2022-jp":
+        try:
+            text = payload.decode("iso-2022-jp").rstrip("\x00")
+            if _looks_like_text(text):
+                return text
+        except UnicodeDecodeError:
+            pass
+        return None
+    # undefined / unknown prefix → None (一般 decoder にフォールスルー)
+    return None
+
 
 def scan_folder_snapshot(folder_path):
     """フォルダ直下を 1 回だけ scandir で走査してスナップショットを返す。
@@ -400,6 +581,9 @@ class ImageViewerApp:
         self.metadata_panel_visible = False
         self.metadata_text_value = None
         self.metadata_cache = OrderedDict()
+        # EXIF ビルド中に一時的に TIFF byte order (">" / "<") を載せる。
+        # _decode_bytes_metadata が UserComment の LE/BE 決定に使う。
+        self._exif_endian = None
         self.render_scheduled = False
         self.render_after_id = None
         self.layout_dirty = False
@@ -2272,21 +2456,63 @@ finally {{
         if png_parameters:
             lines.extend(["", "[A1111 / PNG Parameters]", png_parameters])
 
+        # image.info: 生 EXIF/ICC 等の raw binary キーは skip。
+        # EXIF は下の [EXIF] セクションで構造化して展開する。
         other_info = []
         for key, value in image.info.items():
             if key == "parameters":
+                continue
+            if key in METADATA_INFO_SKIP_KEYS:
                 continue
             other_info.append(f"{key}: {self.format_metadata_value(value)}")
 
         if other_info:
             lines.extend(["", "[Image Info]"] + other_info)
 
+        # EXIF: トップレベル IFD + 拡張 IFD (Exif / GPS / Interop) を展開する。
+        # トップレベルには IFD ポインタ (34665 等) が値ではなくオフセットで入って
+        # いるので、そのままの数値は表示せず get_ifd で中身を取り出す。
         exif_lines = []
         exif_data = image.getexif()
         if exif_data:
-            for tag_id, value in exif_data.items():
-                tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
-                exif_lines.append(f"{tag_name}: {self.format_metadata_value(value)}")
+            # TIFF byte order (BE = ">", LE = "<") を _decode_bytes_metadata へ
+            # 伝えるため一時的に self に載せる。UserComment の UTF-16 で決定的に
+            # LE/BE を選ぶために必要。
+            self._exif_endian = getattr(exif_data, 'endian', None)
+            try:
+                for tag_id, value in exif_data.items():
+                    if tag_id in EXIF_IFD_POINTERS:
+                        continue  # 中身は下で個別展開
+                    tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                    exif_lines.append(
+                        f"{tag_name}: {self.format_metadata_value(value, key=tag_id)}"
+                    )
+
+                # 拡張 IFD の展開。get_ifd も items() 内部の tag 解釈も破損 EXIF で
+                # 各種例外を投げうる (OSError / TypeError / IndexError / struct.error 等)
+                # ので、IFD 単位で幅広く握って silent skip する (情報表示用途なので
+                # 落ちるよりベター)。
+                for ifd_tag, ifd_label in EXIF_IFD_POINTERS.items():
+                    try:
+                        ifd_data = exif_data.get_ifd(ifd_tag)
+                        if not ifd_data:
+                            continue
+                        pending_lines = [f"-- {ifd_label} --"]
+                        tag_map = ExifTags.GPSTAGS if ifd_tag == 0x8825 else ExifTags.TAGS
+                        for tag_id, value in ifd_data.items():
+                            tag_name = tag_map.get(tag_id, str(tag_id))
+                            pending_lines.append(
+                                f"{tag_name}: {self.format_metadata_value(value, key=tag_id)}"
+                            )
+                    except Exception:
+                        # 破損 IFD (壊れた offset / 未知タグの解釈エラー等) は
+                        # 情報表示用途なので silent skip する。
+                        continue
+                    if exif_lines:
+                        exif_lines.append("")
+                    exif_lines.extend(pending_lines)
+            finally:
+                self._exif_endian = None
 
         if exif_lines:
             lines.extend(["", "[EXIF]"] + exif_lines)
@@ -2296,19 +2522,111 @@ finally {{
 
         return "\n".join(lines)
 
-    def format_metadata_value(self, value):
-        """メタ情報の値を読みやすい文字列へ整形する"""
-        if isinstance(value, bytes):
-            for encoding in ("utf-8", "utf-16", "latin-1"):
-                try:
-                    value = value.decode(encoding).rstrip("\x00")
-                    break
-                except UnicodeDecodeError:
-                    continue
-            else:
-                value = value.hex()
+    def format_metadata_value(self, value, *, key=None):
+        """メタ情報の値を読みやすい文字列へ整形する。
 
-        return str(value)
+        key を渡すと EXIF の特殊タグ (UserComment / MakerNote 等) を認識する。
+        bytes 値の decode は printable 率で検証し、utf-16 が偶数バイト長の
+        任意バイナリを (エラーなしで) gibberish に変換するのを排除する。
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, tuple):
+            return "(" + ", ".join(self.format_metadata_value(v) for v in value) + ")"
+        if isinstance(value, list):
+            return "[" + ", ".join(self.format_metadata_value(v) for v in value) + "]"
+        if isinstance(value, dict):
+            items = ", ".join(
+                f"{k}={self.format_metadata_value(v)}" for k, v in value.items()
+            )
+            return "{" + items + "}"
+        if isinstance(value, bytes):
+            return self._decode_bytes_metadata(value, key=key)
+        try:
+            return str(value)
+        except Exception:
+            return f"<{type(value).__name__}>"
+
+    def _decode_bytes_metadata(self, value, *, key=None):
+        """bytes 値の安全な decode。BOM / printable 率 / ASCII 印字率で mojibake を避ける。
+
+        UTF-16 は BOM が付いているケースのみ扱う。BOM 無しの UTF-16 推測は
+        LE/BE の判別が本質的に困難なため撤廃 (UserComment のように tag 由来の
+        endian ヒントが得られる特殊タグでのみ許可)。
+        """
+        if not value:
+            return ""
+
+        # UserComment 特殊フォーマット (charset prefix + TIFF endian) は最優先。
+        # サイズ判定より前に配置しないと UTF-16 の長いプロンプトが summary に落ちる。
+        if key == EXIF_USER_COMMENT_TAG:
+            decoded = _decode_user_comment(value, endian=self._exif_endian)
+            if decoded is not None:
+                return decoded
+
+        # MakerNote (ベンダー独自バイナリ) と巨大バイナリは中身を展開せず summary。
+        if key == EXIF_MAKER_NOTE_TAG or len(value) > METADATA_BINARY_SUMMARY_THRESHOLD:
+            head = value[:32].hex(' ')
+            return f"<{len(value)} バイトのバイナリ> {head}..."
+
+        # BOM 付き UTF-8 / UTF-16
+        if value.startswith(b"\xef\xbb\xbf"):
+            try:
+                text = value[3:].decode("utf-8").rstrip("\x00")
+                if _looks_like_text(text):
+                    return text
+            except UnicodeDecodeError:
+                pass
+        if value.startswith(b"\xff\xfe"):
+            try:
+                text = value[2:].decode("utf-16-le").rstrip("\x00")
+                if _looks_like_text(text):
+                    return text
+            except UnicodeDecodeError:
+                pass
+        if value.startswith(b"\xfe\xff"):
+            try:
+                text = value[2:].decode("utf-16-be").rstrip("\x00")
+                if _looks_like_text(text):
+                    return text
+            except UnicodeDecodeError:
+                pass
+
+        # UTF-8 (厳格 + 検証)
+        try:
+            text = value.decode("utf-8").rstrip("\x00")
+            if _looks_like_text(text):
+                return text
+        except UnicodeDecodeError:
+            pass
+
+        # NOTE: BOM 無し UTF-16 の推測はここでは行わない。LE/BE 誤判定で
+        # printable な CJK mojibake になり判別不能。tag 固有の endian が
+        # 分かる UserComment 経路でのみ扱う。
+
+        # CP932 (Windows 日本語) — utf-8 で失敗するが日本語文字列である可能性
+        try:
+            text = value.decode("cp932").rstrip("\x00")
+            if _looks_like_text(text):
+                return text
+        except UnicodeDecodeError:
+            pass
+
+        # latin-1 は絶対失敗しないので printable 率を厳しめに (0.95)
+        try:
+            text = value.decode("latin-1").rstrip("\x00")
+            if _looks_like_text(text, threshold=0.95):
+                return text
+        except UnicodeDecodeError:
+            pass
+
+        # 全て失敗 → hex summary
+        head = value[:32].hex(' ')
+        return f"<{len(value)} バイト> {head}..."
 
     def get_metadata_text_for_path(self, image_path, image=None):
         """画像ごとのメタ情報文字列をキャッシュして返す"""
