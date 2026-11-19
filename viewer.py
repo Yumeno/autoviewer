@@ -120,7 +120,8 @@ THUMBNAIL_CELL_WIDTH = 124          # 1 セルの横幅 (px)。index i のセル
 THUMBNAIL_BOX_WIDTH = 116           # セル内の枠の幅
 THUMBNAIL_BOX_HEIGHT = 100          # セル内の枠の高さ
 THUMBNAIL_STRIP_HEIGHT = 128        # キャンバスの高さ (上余白 4 + 枠 100 + 連番の行 + 下余白)。連番が切れない高さにする
-THUMBNAIL_SCROLLBAR_HEIGHT = 10     # 帯の下の横スクロール表示 (自前描画) の高さ
+OPERATION_PANEL_STRIP_GAP = 8       # 操作パネルをサムネイル帯の上へ寄せるときの隙間 (px)
+THUMBNAIL_SCROLLBAR_HEIGHT = 10    # 帯の下の横スクロール表示 (自前描画) の高さ
 THUMBNAIL_SCROLLBAR_MIN_THUMB = 36  # つまみの最小の長さ (枚数が多くても掴めるように)
 THUMBNAIL_OVERSCAN_CELLS = 2        # 可視範囲の外側にもキャンバスアイテムを持つセル数
 THUMBNAIL_PREFETCH_CELLS = 40       # 可視範囲の外側で先読み生成するセル数
@@ -1107,6 +1108,9 @@ class ImageViewerApp:
         self.thumbnail_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
         self.thumbnail_frame.grid_remove()
         self.thumbnail_frame.grid_propagate(False)
+        # 帯の表示 / 非表示 / 位置の変化に合わせて、操作パネルを帯の上へ寄せ直す
+        for sequence in ("<Configure>", "<Map>", "<Unmap>"):
+            self.thumbnail_frame.bind(sequence, self.place_operation_panel, add="+")
         self.thumbnail_header = tk.Label(
             self.thumbnail_frame,
             text="THUMBNAILS",
@@ -4760,9 +4764,23 @@ finally {{
             self.seekbar_frame.place_forget()
             self.seekbar_visible = False
         else:
-            # 画面下部に配置
-            self.seekbar_frame.place(relx=0.5, rely=0.96, anchor=tk.S, relwidth=0.85)
             self.seekbar_visible = True
+            self.place_operation_panel()
+
+    def place_operation_panel(self, event=None):
+        """操作パネルを画面下部に配置する。サムネイル帯が出ている間は、帯に重ならないよう
+        帯のすぐ上に寄せる (帯の <Configure> / <Map> / <Unmap> からも呼ばれて追従する)。"""
+        if not self.seekbar_visible:
+            return
+        strip = self.thumbnail_frame
+        if strip.winfo_ismapped() and strip.winfo_y() > 0:
+            # thumbnail_frame の親 (content_frame) は root 全面なので、winfo_y は root 座標と一致する
+            self.seekbar_frame.place(
+                relx=0.5, rely=0.0, y=strip.winfo_y() - OPERATION_PANEL_STRIP_GAP,
+                anchor=tk.S, relwidth=0.85,
+            )
+        else:
+            self.seekbar_frame.place(relx=0.5, rely=0.96, y=0, anchor=tk.S, relwidth=0.85)
 
     def on_seek(self, value):
         """シークバーをドラッグしてページ指定したときの処理"""
