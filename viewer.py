@@ -333,6 +333,52 @@ def scan_folder_snapshot(folder_path):
     return snapshot, stat_failed
 
 
+def normalize_folder_key(folder_path):
+    """フォルダ同士の同一判定用に、大文字小文字・区切り・相対表記を正規化した文字列を返す。"""
+    return os.path.normcase(os.path.normpath(os.path.abspath(folder_path)))
+
+
+def scan_folders_snapshot(folder_paths, previous_snapshot):
+    """複数フォルダ (各フォルダ直下のみ) をまとめて走査してマージしたスナップショットを返す。
+
+    戻り値: (snapshot, stat_failed, failed_folders)
+        snapshot:       {path: (mtime_ns, size)} 全フォルダ分のマージ結果
+        stat_failed:    stat に失敗したパス集合。scandir 自体が失敗したフォルダについては、
+                        previous_snapshot のうちそのフォルダ直下にあるパスを全て含める
+                        (呼び出し側は「削除扱いしない・前回値を持ち越す」と解釈するので、
+                        ネットワーク共有の切断などでそのフォルダの画像が消えない)
+        failed_folders: scandir 自体が失敗したフォルダ (指定された文字列のまま) のリスト
+
+    この関数は例外を投げない。
+    """
+    snapshot = {}
+    stat_failed = set()
+    failed_folders = []
+    failed_keys = set()
+    for folder in folder_paths:
+        try:
+            folder_snapshot, folder_failed = scan_folder_snapshot(folder)
+        except OSError:
+            failed_folders.append(folder)
+            failed_keys.add(normalize_folder_key(folder))
+            continue
+        snapshot.update(folder_snapshot)
+        stat_failed |= folder_failed
+    if failed_keys:
+        # 正規化 (abspath) は 1 件ごとだと重いので、親フォルダの文字列ごとに 1 回だけ行う。
+        # 失敗が続く間は毎周期ここを通るため、枚数に比例したコストを避ける。
+        parent_failed = {}
+        for path in previous_snapshot:
+            parent = os.path.dirname(path)
+            is_failed = parent_failed.get(parent)
+            if is_failed is None:
+                is_failed = normalize_folder_key(parent) in failed_keys
+                parent_failed[parent] = is_failed
+            if is_failed:
+                stat_failed.add(path)
+    return snapshot, stat_failed, failed_folders
+
+
 def diff_snapshots(prev, current, stat_failed):
     """前回・今回のスナップショットから (added, removed, modified) を計算する。
 
@@ -584,7 +630,10 @@ class ImageViewerApp:
         self.root.configure(bg=MUSEUM_BG_BASE)
 
         # アプリの状態変数
-        self.folder_path = ""
+        self.folder_paths = []  # 対象フォルダ (指定順)
+        self.last_failed_folders = ()  # 直近のスキャンで失敗したフォルダ (ログの重複抑止用)
+        self.last_added_folder = None  # 「追加」ダイアログの initialdir 用
+        self.folder_dialog = None  #「対象フォルダ」編集ダイアログ (開いている間のみ)
         self.image_list = []
         self.current_index = -1
         self.interval_ms = 5000  # デフォルト5秒
@@ -1290,24 +1339,14 @@ class ImageViewerApp:
         # --- Section: 監視対象フォルダ ---
         self._museum_section_header(content, "対象フォルダ").pack(anchor='w', pady=(0, 8))
 
-        folder_row = tk.Frame(content, bg=MUSEUM_BG_BASE)
-        folder_row.pack(fill=tk.X, pady=(0, 4))
-
-        self.folder_var = tk.StringVar(value="フォルダが選択されていません")
-        folder_display = tk.Label(
-            folder_row, textvariable=self.folder_var,
-            bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_SECONDARY,
-            font=MUSEUM_FONT_BODY,
-            anchor='w',
-            padx=14, pady=10,
-            bd=0, highlightthickness=1, highlightbackground=MUSEUM_BORDER,
-            width=44,
-        )
-        folder_display.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self._museum_button(
-            folder_row, "選択", self.select_folder, variant='default', width=8,
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        # 設定画面の一覧は self.folder_paths そのものを編集する
+        self.settings_folder_editor = self._build_folder_list_editor(content, self.folder_paths)
+        self.settings_folder_editor['frame'].pack(fill=tk.X, pady=(0, 4))
+        tk.Label(
+            content,
+            text="複数指定可。全フォルダの画像を更新日時の古い順に混ぜて再生します (各フォルダ直下のみ)",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_DISABLED, font=MUSEUM_FONT_HELP, anchor='w',
+        ).pack(anchor='w', pady=(4, 0))
 
         # 区切り
         tk.Frame(content, bg=MUSEUM_BG_BASE, height=18).pack()
@@ -1404,15 +1443,89 @@ class ImageViewerApp:
             justify=tk.CENTER,
         ).pack()
 
-    def select_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.set_folder(folder)
+    def _add_folder_to(self, paths, folder):
+        """paths にフォルダを追加する。既に (正規化して) 登録済みなら何もせず False を返す。"""
+        normalized = os.path.normpath(os.path.abspath(folder))
+        key = normalize_folder_key(normalized)
+        if any(normalize_folder_key(p) == key for p in paths):
+            return False
+        paths.append(normalized)
+        self.last_added_folder = normalized
+        return True
 
-    def set_folder(self, folder):
-        """対象フォルダの状態表示を更新"""
-        self.folder_path = folder
-        self.folder_var.set(f"選択中: {self.folder_path}")
+    def _build_folder_list_editor(self, parent, paths, dialog_parent=None):
+        """フォルダ一覧 (Listbox) + 「追加」「削除」ボタンを組み立てる。
+
+        paths (list) をその場で編集する。設定画面とフォルダ編集ダイアログで共通に使う。
+        戻り値: {'frame', 'listbox', 'refresh', 'add', 'remove'}"""
+        frame = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+
+        list_frame = tk.Frame(
+            frame, bg=MUSEUM_BG_INPUT,
+            highlightthickness=1, highlightbackground=MUSEUM_BORDER,
+        )
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        y_scroll = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        x_scroll = tk.Scrollbar(list_frame, orient=tk.HORIZONTAL)
+        listbox = tk.Listbox(
+            list_frame,
+            height=4, width=46,
+            activestyle='none',
+            exportselection=False,
+            selectmode=tk.SINGLE,
+            bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_PRIMARY,
+            selectbackground=MUSEUM_ACCENT, selectforeground=MUSEUM_BG_BASE,
+            font=MUSEUM_FONT_BODY,
+            bd=0, relief=tk.FLAT, highlightthickness=0,
+            yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set,
+        )
+        y_scroll.config(command=listbox.yview)
+        x_scroll.config(command=listbox.xview)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        def refresh():
+            listbox.delete(0, tk.END)
+            if not paths:
+                listbox.insert(tk.END, "フォルダが選択されていません")
+                listbox.itemconfig(0, fg=MUSEUM_FG_SECONDARY, selectforeground=MUSEUM_FG_SECONDARY,
+                                   selectbackground=MUSEUM_BG_INPUT)
+                return
+            for p in paths:
+                listbox.insert(tk.END, p)
+
+        def add():
+            folder = filedialog.askdirectory(
+                parent=dialog_parent or self.root,
+                initialdir=getattr(self, 'last_added_folder', None) or None,
+            )
+            if folder and self._add_folder_to(paths, folder):
+                refresh()
+                listbox.selection_clear(0, tk.END)
+                listbox.selection_set(len(paths) - 1)
+                listbox.see(len(paths) - 1)
+
+        def remove():
+            selection = listbox.curselection()
+            if not selection or not paths:
+                return
+            index = selection[0]
+            if index >= len(paths):
+                return
+            del paths[index]
+            refresh()
+            if paths:
+                listbox.selection_set(min(index, len(paths) - 1))
+
+        buttons = tk.Frame(frame, bg=MUSEUM_BG_BASE)
+        buttons.pack(side=tk.LEFT, padx=(8, 0), anchor='n')
+        self._museum_button(buttons, "追加", add, variant='default', width=8).pack(fill=tk.X)
+        self._museum_button(buttons, "削除", remove, variant='default', width=8).pack(fill=tk.X, pady=(6, 0))
+
+        refresh()
+        return {'frame': frame, 'listbox': listbox, 'refresh': refresh, 'add': add, 'remove': remove}
 
     def format_interval_seconds(self, seconds):
         """表示用に秒数を整形"""
@@ -3157,9 +3270,26 @@ finally {{
     def start_polling(self):
         """ポーリングループを開始する (既存予約は破棄)"""
         self.cancel_polling()
-        if not self.is_slideshow_active or not self.folder_path or not self.polling_enabled:
+        if not self.is_slideshow_active or not self.folder_paths or not self.polling_enabled:
             return
         self.poll_after_id = self.root.after(self.poll_interval_ms, self.poll_folder)
+
+    def scan_all_folders(self, label):
+        """全対象フォルダを走査する。失敗フォルダの集合が変わったときだけログを出す。
+
+        戻り値: (snapshot, stat_failed)。scandir に失敗したフォルダの既知パスは
+        stat_failed に入っているので、呼び出し側は「削除扱いしない」まま扱える。"""
+        snapshot, stat_failed, failed_folders = scan_folders_snapshot(
+            self.folder_paths, self.folder_snapshot,
+        )
+        failed_key = tuple(sorted(normalize_folder_key(f) for f in failed_folders))
+        if failed_key != self.last_failed_folders:
+            if failed_folders:
+                print(f"[{label}] listdir failed for: {', '.join(failed_folders)}")
+            else:
+                print(f"[{label}] 全フォルダのスキャンが復帰しました")
+            self.last_failed_folders = failed_key
+        return snapshot, stat_failed
 
     def cancel_polling(self):
         """次回ポーリング予約を破棄する"""
@@ -3249,7 +3379,7 @@ finally {{
         """ポーリング 1 周期 (Tk メインスレッドで動作)"""
         self.poll_after_id = None
         try:
-            if not self.is_slideshow_active or not self.folder_path or not self.polling_enabled:
+            if not self.is_slideshow_active or not self.folder_paths or not self.polling_enabled:
                 return
             # 単発チェック中は auto poll が割り込まないようにスキップ。
             # (manual の phase1 と phase2 の間に folder_snapshot を動かすと
@@ -3257,13 +3387,9 @@ finally {{
             if self.manual_check_after_id is not None:
                 return
 
-            try:
-                current_snapshot, stat_failed = scan_folder_snapshot(self.folder_path)
-            except OSError as exc:
-                # listdir 自体が失敗した場合は状態を変更せずに次の周期へ。
-                # (ネットワークドライブの瞬断などで、ここで削除扱いにすると混乱するため)
-                print(f"[poll] listdir failed for {self.folder_path}: {exc}")
-                return
+            # listdir 自体が失敗したフォルダの既知パスは stat_failed に入って返る
+            # (ネットワークドライブの瞬断などで、そのフォルダの画像を削除扱いにしない)。
+            current_snapshot, stat_failed = self.scan_all_folders("poll")
 
             stable_snapshot = self.resolve_stable_snapshot(current_snapshot, stat_failed)
             added, removed, modified = diff_snapshots(self.folder_snapshot, stable_snapshot, stat_failed)
@@ -3277,7 +3403,7 @@ finally {{
                 self.apply_folder_diff(added, removed, modified, new_snapshot=new_snapshot)
         finally:
             # 例外が出ても polling は止めない (finally で必ず再予約)
-            if self.is_slideshow_active and self.folder_path and self.polling_enabled:
+            if self.is_slideshow_active and self.folder_paths and self.polling_enabled:
                 self.poll_after_id = self.root.after(self.poll_interval_ms, self.poll_folder)
 
     def request_manual_check(self):
@@ -3285,17 +3411,13 @@ finally {{
 
         100ms 間隔で 2 回スキャンし、両方で (mtime_ns, size) が一致したものだけを
         反映する。書き込み途中のファイルは弾く。"""
-        if not self.folder_path:
+        if not self.folder_paths:
             return
         if self.manual_check_after_id is not None:
             # 既に進行中なら多重起動しない
             return
 
-        try:
-            first_snapshot, first_failed = scan_folder_snapshot(self.folder_path)
-        except OSError as exc:
-            print(f"[manual_check] listdir failed: {exc}")
-            return
+        first_snapshot, first_failed = self.scan_all_folders("manual_check")
 
         self.manual_check_after_id = self.root.after(
             MANUAL_CHECK_GAP_MS,
@@ -3305,14 +3427,10 @@ finally {{
     def _manual_check_phase2(self, first_snapshot, first_failed):
         """単発チェックの 2 回目スキャンと差分反映"""
         self.manual_check_after_id = None
-        if not self.folder_path:
+        if not self.folder_paths:
             return
 
-        try:
-            second_snapshot, second_failed = scan_folder_snapshot(self.folder_path)
-        except OSError as exc:
-            print(f"[manual_check] listdir failed (2nd pass): {exc}")
-            return
+        second_snapshot, second_failed = self.scan_all_folders("manual_check")
 
         combined_failed = first_failed | second_failed
         baseline = self.folder_snapshot  # auto poll は manual_check_after_id != None で抑止済み
@@ -3551,14 +3669,12 @@ finally {{
         """対象フォルダをスキャンして image_list と folder_snapshot を構築する。"""
         self.image_list = []
         self.folder_snapshot = {}
-        if not self.folder_path:
+        if not self.folder_paths:
             return
 
-        try:
-            snapshot, _stat_failed = scan_folder_snapshot(self.folder_path)
-        except OSError as exc:
-            print(f"Failed to scan folder {self.folder_path}: {exc}")
-            return
+        # folder_snapshot は空にしてあるので、失敗フォルダは単に画像 0 件として扱われる
+        # (以後のポーリングで復帰したときに added として取り込まれる)
+        snapshot, _stat_failed = self.scan_all_folders("load")
 
         self.folder_snapshot = snapshot
         self.image_list = list(snapshot.keys())
@@ -3602,20 +3718,129 @@ finally {{
         self.update_delete_button_state()
 
     def change_folder_during_slideshow(self):
-        """再生中に対象フォルダを切り替える"""
-        if not self.is_slideshow_active:
+        """再生中に対象フォルダ一覧を編集するモーダルダイアログを開く"""
+        if not self.is_slideshow_active or self.folder_dialog is not None:
             return
 
-        folder = filedialog.askdirectory(initialdir=self.folder_path or None)
-        if not folder:
+        edited = list(self.folder_paths)  # 編集用コピー (「適用」するまで本体は変えない)
+        result = {'applied': False}
+
+        dialog = tk.Toplevel(self.root)
+        self.folder_dialog = dialog
+        dialog.title("対象フォルダ")
+        dialog.configure(bg=MUSEUM_BG_BASE)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        body = tk.Frame(dialog, bg=MUSEUM_BG_BASE)
+        body.pack(padx=24, pady=20)
+        self._museum_section_header(body, "対象フォルダ").pack(anchor='w', pady=(0, 8))
+
+        editor = self._build_folder_list_editor(body, edited, dialog_parent=dialog)
+        editor['frame'].pack(fill=tk.X)
+        tk.Label(
+            body,
+            text="全フォルダの画像を更新日時の古い順に混ぜて再生します (各フォルダ直下のみ)",
+            bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_DISABLED, font=MUSEUM_FONT_HELP, anchor='w',
+        ).pack(anchor='w', pady=(6, 0))
+
+        def apply_and_close():
+            if not edited:
+                messagebox.showwarning("警告", "フォルダを 1 つ以上指定してください。", parent=dialog)
+                return
+            result['applied'] = True
+            dialog.destroy()
+
+        def cancel_and_close(event=None):
+            dialog.destroy()
+            return "break"
+
+        button_row = tk.Frame(body, bg=MUSEUM_BG_BASE)
+        button_row.pack(fill=tk.X, pady=(16, 0))
+        apply_button = self._museum_button(button_row, "適用", apply_and_close, variant='primary', width=10)
+        apply_button.pack(side=tk.RIGHT)
+        self._museum_button(button_row, "キャンセル", cancel_and_close, variant='default', width=10).pack(
+            side=tk.RIGHT, padx=(0, 8),
+        )
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
+        dialog.bind("<Escape>", cancel_and_close)
+        # テスト・自動操作用: ダイアログを閉じずに中身を触るための参照
+        dialog.folder_editor = editor
+        dialog.apply_button = apply_button
+        dialog.cancel_action = cancel_and_close
+
+        try:
+            dialog.update_idletasks()
+            # 親ウィンドウの中央付近に出す
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_reqheight()) // 2)
+            dialog.geometry(f"+{x}+{y}")
+            dialog.wait_visibility()
+            dialog.grab_set()
+            dialog.focus_set()
+            dialog.wait_window()
+        except tk.TclError:
+            # アプリ終了などでダイアログ / root が先に破棄された場合
+            pass
+        finally:
+            self.folder_dialog = None
+
+        if not result['applied']:
+            return
+        try:
+            if not self.root.winfo_exists() or not self.is_slideshow_active:
+                return
+        except tk.TclError:
             return
 
-        self.set_folder(folder)
-        self.refresh_current_folder()
+        changed = (
+            [normalize_folder_key(p) for p in edited]
+            != [normalize_folder_key(p) for p in self.folder_paths]
+        )
+        if not changed:
+            return
+        # 設定画面の一覧ウィジェットが同じリストを参照しているので、in-place で更新する
+        old_keys = {normalize_folder_key(p) for p in self.folder_paths}
+        new_keys = {normalize_folder_key(p) for p in edited}
+        self.folder_paths[:] = edited
+        self.settings_folder_editor['refresh']()
+        if old_keys == new_keys:
+            return
+
+        # 表示中の画像のフォルダが残っているなら、差分として反映して再生位置を保つ
+        # (フォルダを足しただけで先頭へ戻されないように)。即時チェックの 2 回スキャンに
+        # 乗せることで、外したフォルダの画像は削除、足したフォルダの画像は追加として
+        # apply_folder_diff を通る。
+        current_path = self.get_current_image_path()
+        current_folder_kept = (
+            current_path is not None
+            and normalize_folder_key(os.path.dirname(current_path)) in new_keys
+        )
+        if current_folder_kept:
+            if self.manual_check_after_id is not None:
+                # 進行中の即時チェックは旧フォルダ構成の 1 回目を持っているので捨てる
+                self.root.after_cancel(self.manual_check_after_id)
+                self.manual_check_after_id = None
+            self.pending_changes = {}
+            self.request_manual_check()
+        else:
+            # 表示中の画像が対象外になった (または画像が無かった) 場合は先頭から読み直す
+            self.refresh_current_folder()
+
+    def close_folder_dialog(self):
+        """開いている「対象フォルダ」ダイアログがあれば破棄する (終了 / メニュー復帰用)"""
+        dialog = self.folder_dialog
+        if dialog is None:
+            return
+        try:
+            dialog.destroy()
+        except tk.TclError:
+            pass
 
     def start_slideshow(self):
         """スライドショーの開始"""
-        if not self.folder_path:
+        if not self.folder_paths:
             messagebox.showwarning("警告", "フォルダを選択してください。")
             return
         
@@ -3656,6 +3881,7 @@ finally {{
 
     def return_to_menu(self):
         """再生を止めて設定画面へ戻る"""
+        self.close_folder_dialog()
         self.is_slideshow_active = False
         self.set_fullscreen_state(False)
         self.menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
@@ -4008,6 +4234,7 @@ finally {{
 
     def on_closing(self):
         """アプリ終了時の処理"""
+        self.close_folder_dialog()
         self.cancel_polling()
         if self.manual_check_after_id is not None:
             self.root.after_cancel(self.manual_check_after_id)
