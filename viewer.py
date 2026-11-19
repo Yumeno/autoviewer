@@ -737,8 +737,23 @@ def make_thumbnail_image(image_path):
             image.draft("RGB", THUMBNAIL_SIZE)
         image.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
         if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
-            return image.convert("RGBA")
-        return image.convert("RGB")
+            result = image.convert("RGBA")
+        else:
+            result = image.convert("RGB")
+
+    # 枠より小さい画像は、縦横比を保ったまま長辺が枠に合うよう拡大する
+    # (thumbnail() は縮小しかしない。メイン表示も小さい画像を拡大するので、それに揃える)
+    width, height = result.size
+    if width > 0 and height > 0:
+        scale = min(THUMBNAIL_SIZE[0] / width, THUMBNAIL_SIZE[1] / height)
+        if scale > 1.0:
+            target = (
+                max(1, min(THUMBNAIL_SIZE[0], round(width * scale))),
+                max(1, min(THUMBNAIL_SIZE[1], round(height * scale))),
+            )
+            if target != result.size:
+                result = result.resize(target, Image.Resampling.LANCZOS)
+    return result
 
 
 def thumbnail_worker_loop(pool):
