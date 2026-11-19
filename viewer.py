@@ -119,7 +119,10 @@ THUMBNAIL_SIZE = (112, 96)
 THUMBNAIL_CELL_WIDTH = 124          # 1 セルの横幅 (px)。index i のセルは x = i * この値
 THUMBNAIL_BOX_WIDTH = 116           # セル内の枠の幅
 THUMBNAIL_BOX_HEIGHT = 100          # セル内の枠の高さ
-THUMBNAIL_STRIP_HEIGHT = 116        # キャンバスの高さ (枠 + 連番)
+THUMBNAIL_STRIP_HEIGHT = 128        # キャンバスの高さ (上余白 4 + 枠 100 + 連番の行 + 下余白)。連番が切れない高さにする
+OPERATION_PANEL_STRIP_GAP = 8       # 操作パネルをサムネイル帯の上へ寄せるときの隙間 (px)
+THUMBNAIL_SCROLLBAR_HEIGHT = 10    # 帯の下の横スクロール表示 (自前描画) の高さ
+THUMBNAIL_SCROLLBAR_MIN_THUMB = 36  # つまみの最小の長さ (枚数が多くても掴めるように)
 THUMBNAIL_OVERSCAN_CELLS = 2        # 可視範囲の外側にもキャンバスアイテムを持つセル数
 THUMBNAIL_PREFETCH_CELLS = 40       # 可視範囲の外側で先読み生成するセル数
 THUMBNAIL_WORKER_COUNT = 2
@@ -1105,6 +1108,9 @@ class ImageViewerApp:
         self.thumbnail_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
         self.thumbnail_frame.grid_remove()
         self.thumbnail_frame.grid_propagate(False)
+        # 帯の表示 / 非表示 / 位置の変化に合わせて、操作パネルを帯の上へ寄せ直す
+        for sequence in ("<Configure>", "<Map>", "<Unmap>"):
+            self.thumbnail_frame.bind(sequence, self.place_operation_panel, add="+")
         self.thumbnail_header = tk.Label(
             self.thumbnail_frame,
             text="THUMBNAILS",
@@ -1125,14 +1131,28 @@ class ImageViewerApp:
             highlightthickness=0,
             cursor='hand2',
         )
-        self.thumbnail_scrollbar = tk.Scrollbar(
+        # 暗いテーマに合わせた横スクロール表示 (tk.Scrollbar は色を変えられず、明るいグレーで浮くため自前)
+        self.thumbnail_scrollbar = tk.Canvas(
             self.thumbnail_frame,
-            orient=tk.HORIZONTAL,
-            command=self.thumbnail_canvas.xview,
+            height=THUMBNAIL_SCROLLBAR_HEIGHT,
+            bg=MUSEUM_BG_INPUT,
+            bd=0,
+            highlightthickness=0,
+            cursor='hand2',
         )
+        self.thumbnail_sb = {'first': 0.0, 'last': 1.0, 'hover': False, 'drag': None}
+        self.thumbnail_scrollbar.bind('<ButtonPress-1>', self.on_thumbnail_sb_press)
+        self.thumbnail_scrollbar.bind('<B1-Motion>', self.on_thumbnail_sb_motion)
+        self.thumbnail_scrollbar.bind('<ButtonRelease-1>', self.on_thumbnail_sb_release)
+        self.thumbnail_scrollbar.bind('<Enter>', lambda e: self.set_thumbnail_sb_hover(True))
+        self.thumbnail_scrollbar.bind('<Leave>', lambda e: self.set_thumbnail_sb_hover(False))
+        self.thumbnail_scrollbar.bind('<Configure>', lambda e: self.draw_thumbnail_scrollbar())
+        self.thumbnail_scrollbar.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
         self.thumbnail_canvas.configure(xscrollcommand=self.on_thumbnail_xscroll)
-        self.thumbnail_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
-        self.thumbnail_scrollbar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        # スクロール表示を先に下端へ確保してから、残りをキャンバスに渡す
+        # (帯の高さが足りないとき、キャンバス下端の連番にスクロール表示が重ならないように)
+        self.thumbnail_scrollbar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 10))
+        self.thumbnail_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
         self.thumbnail_canvas.bind("<Configure>", self.on_thumbnail_canvas_configure)
         self.thumbnail_canvas.bind("<Button-1>", self.on_thumbnail_click)
         self.thumbnail_frame.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
@@ -2985,8 +3005,70 @@ finally {{
 
     def on_thumbnail_xscroll(self, first, last):
         """キャンバスのスクロール通知 (スクロールバー更新 + 可視範囲の再描画要求)"""
-        self.thumbnail_scrollbar.set(first, last)
+        self.thumbnail_sb['first'] = float(first)
+        self.thumbnail_sb['last'] = float(last)
+        self.draw_thumbnail_scrollbar()
         self.request_thumbnail_viewport_update()
+
+    def get_thumbnail_sb_geometry(self):
+        """横スクロール表示のつまみ位置を返す: (トラック幅, つまみ左端, つまみ長さ, 表示割合)。
+        全体が見えていてスクロール不要なら つまみ長さ は 0。"""
+        width = max(1, self.thumbnail_scrollbar.winfo_width())
+        span = self.thumbnail_sb['last'] - self.thumbnail_sb['first']
+        if span >= 1.0 or span <= 0.0:
+            return width, 0.0, 0.0, span
+        thumb = min(width, max(THUMBNAIL_SCROLLBAR_MIN_THUMB, span * width))
+        # つまみに最小長を持たせるので、位置は「動ける範囲」に対する割合で求める
+        left = self.thumbnail_sb['first'] / (1.0 - span) * (width - thumb)
+        return width, left, thumb, span
+
+    def draw_thumbnail_scrollbar(self):
+        """横スクロール表示を描き直す"""
+        bar = self.thumbnail_scrollbar
+        bar.delete('all')
+        _width, left, thumb, _span = self.get_thumbnail_sb_geometry()
+        if thumb <= 0:
+            return
+        active = self.thumbnail_sb['hover'] or self.thumbnail_sb['drag'] is not None
+        color = MUSEUM_FG_SECONDARY if active else MUSEUM_BORDER
+        bar.create_rectangle(
+            left, 0, left + thumb, THUMBNAIL_SCROLLBAR_HEIGHT, fill=color, outline=color,
+        )
+
+    def set_thumbnail_sb_hover(self, hover):
+        self.thumbnail_sb['hover'] = hover
+        self.draw_thumbnail_scrollbar()
+
+    def move_thumbnail_sb_to(self, thumb_left):
+        """つまみ左端が thumb_left (px) に来るようキャンバスをスクロールする"""
+        width, _left, thumb, span = self.get_thumbnail_sb_geometry()
+        if thumb <= 0 or width <= thumb:
+            return
+        fraction = min(1.0, max(0.0, thumb_left / (width - thumb)))
+        self.thumbnail_canvas.xview_moveto(fraction * (1.0 - span))
+
+    def on_thumbnail_sb_press(self, event):
+        """つまみを掴む。トラックをクリックした場合は、その位置がつまみの中心になるよう移動する"""
+        _width, left, thumb, _span = self.get_thumbnail_sb_geometry()
+        if thumb <= 0:
+            return
+        # 手動でスクロールし始めたら、予約済みの「現在画像への追従」は取り消す
+        self.cancel_thumbnail_follow()
+        if left <= event.x <= left + thumb:
+            self.thumbnail_sb['drag'] = event.x - left
+        else:
+            self.thumbnail_sb['drag'] = thumb / 2
+            self.move_thumbnail_sb_to(event.x - thumb / 2)
+        self.draw_thumbnail_scrollbar()
+
+    def on_thumbnail_sb_motion(self, event):
+        if self.thumbnail_sb['drag'] is None:
+            return
+        self.move_thumbnail_sb_to(event.x - self.thumbnail_sb['drag'])
+
+    def on_thumbnail_sb_release(self, event):
+        self.thumbnail_sb['drag'] = None
+        self.draw_thumbnail_scrollbar()
 
     def on_thumbnail_canvas_configure(self, event=None):
         """サムネイルキャンバスのサイズ変更時に可視範囲を再計算"""
@@ -4682,9 +4764,23 @@ finally {{
             self.seekbar_frame.place_forget()
             self.seekbar_visible = False
         else:
-            # 画面下部に配置
-            self.seekbar_frame.place(relx=0.5, rely=0.96, anchor=tk.S, relwidth=0.85)
             self.seekbar_visible = True
+            self.place_operation_panel()
+
+    def place_operation_panel(self, event=None):
+        """操作パネルを画面下部に配置する。サムネイル帯が出ている間は、帯に重ならないよう
+        帯のすぐ上に寄せる (帯の <Configure> / <Map> / <Unmap> からも呼ばれて追従する)。"""
+        if not self.seekbar_visible:
+            return
+        strip = self.thumbnail_frame
+        if strip.winfo_ismapped() and strip.winfo_y() > 0:
+            # thumbnail_frame の親 (content_frame) は root 全面なので、winfo_y は root 座標と一致する
+            self.seekbar_frame.place(
+                relx=0.5, rely=0.0, y=strip.winfo_y() - OPERATION_PANEL_STRIP_GAP,
+                anchor=tk.S, relwidth=0.85,
+            )
+        else:
+            self.seekbar_frame.place(relx=0.5, rely=0.96, y=0, anchor=tk.S, relwidth=0.85)
 
     def on_seek(self, value):
         """シークバーをドラッグしてページ指定したときの処理"""
