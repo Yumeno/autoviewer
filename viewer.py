@@ -1,7 +1,9 @@
 import os
 import shutil
 import subprocess
+import queue
 import sys
+import threading
 import time
 import tempfile
 import tkinter as tk
@@ -99,6 +101,22 @@ DEBUG_HUD_REFRESH_MS = 100
 IMAGE_OPEN_RETRY_DELAY_MS = 500
 IMAGE_OPEN_MAX_ATTEMPTS = 3
 METADATA_CACHE_MAX_ITEMS = 256
+
+# サムネイル帯 (仮想化 + ワーカースレッドによる遅延生成)
+THUMBNAIL_SIZE = (112, 96)
+THUMBNAIL_CELL_WIDTH = 124          # 1 セルの横幅 (px)。index i のセルは x = i * この値
+THUMBNAIL_BOX_WIDTH = 116           # セル内の枠の幅
+THUMBNAIL_BOX_HEIGHT = 100          # セル内の枠の高さ
+THUMBNAIL_STRIP_HEIGHT = 116        # キャンバスの高さ (枠 + 連番)
+THUMBNAIL_OVERSCAN_CELLS = 2        # 可視範囲の外側にもキャンバスアイテムを持つセル数
+THUMBNAIL_PREFETCH_CELLS = 40       # 可視範囲の外側で先読み生成するセル数
+THUMBNAIL_WORKER_COUNT = 2
+THUMBNAIL_CACHE_MAX_ITEMS = 600
+THUMBNAIL_POLL_MS = 30              # 結果キューの drain 間隔
+THUMBNAIL_DRAIN_MAX_PER_TICK = 8    # 1 回の drain で PhotoImage 化する最大件数
+THUMBNAIL_MAX_ATTEMPTS = 3          # デコード失敗時の最大試行回数
+THUMBNAIL_RETRY_DELAY_MS = 1000
+THUMBNAIL_FAILED_BG = '#444444'
 
 # image.info のうち、生 EXIF ブロックや ICC プロファイル等の「バイナリを
 # そのまま人間向けに出しても意味が無い」キーは display から除外する。
@@ -524,6 +542,39 @@ def _trash_linux(abs_path):
     )
 
 
+def make_thumbnail_image(image_path):
+    """サムネイル用の縮小画像 (PIL Image) を作る。ワーカースレッドから呼ばれるため Tk には触れない。"""
+    with Image.open(image_path) as image:
+        if image.format == "JPEG":
+            # JPEG は縮小デコードで高速化する
+            image.draft("RGB", THUMBNAIL_SIZE)
+        image.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+        if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+            return image.convert("RGBA")
+        return image.convert("RGB")
+
+
+def thumbnail_worker_loop(pool):
+    """サムネイル生成ワーカー。pool は UI 側と共有する dict (lock / pending / inflight / work / stop / results)。"""
+    while not pool["stop"].is_set():
+        pool["work"].wait(0.5)
+        if pool["stop"].is_set():
+            return
+        with pool["lock"]:
+            if not pool["pending"]:
+                pool["work"].clear()
+                continue
+            item = pool["pending"].pop(0)
+            pool["inflight"].add(item[0])
+        path, sig, generation = item
+        try:
+            result = make_thumbnail_image(path)
+        except Exception:
+            result = None
+        # inflight からの除去は UI スレッドが結果を drain した時点で行う (未 drain の結果の再依頼を防ぐ)
+        pool["results"].put((path, sig, generation, result))
+
+
 class ImageViewerApp:
     def __init__(self, root):
         self.root = root
@@ -543,10 +594,16 @@ class ImageViewerApp:
         self.after_id = None
         self.thumbnail_visible = False
         self.metadata_visible = False
-        self.thumbnail_photos = {}
-        self.thumbnail_buttons = {}
-        self.thumbnail_items = {}
-        self.thumbnail_labels = {}
+        # サムネイル帯 (仮想化): path -> (snapshot sig, PhotoImage) の LRU キャッシュ
+        self.thumbnail_cache = OrderedDict()
+        self.thumbnail_cells = {}  # index -> {"ids": [...], "state": (...), "path": str}
+        self.thumbnail_failures = {}  # path -> 失敗回数
+        self.thumbnail_failure_time = {}  # path -> 最終失敗時刻 (perf_counter)
+        self.thumbnail_generation = 0
+        self.thumbnail_pool = None
+        self.thumbnail_poll_after_id = None
+        self.thumbnail_viewport_after_id = None
+        self.thumbnail_retry_after_id = None
         self.current_source_image = None
         self.current_source_path = None
         self.current_render_image = None
@@ -854,25 +911,23 @@ class ImageViewerApp:
         self.thumbnail_canvas = tk.Canvas(
             self.thumbnail_frame,
             bg=MUSEUM_BG_SURFACE,
-            height=116,
+            height=THUMBNAIL_STRIP_HEIGHT,
             bd=0,
             highlightthickness=0,
+            cursor='hand2',
         )
         self.thumbnail_scrollbar = tk.Scrollbar(
             self.thumbnail_frame,
             orient=tk.HORIZONTAL,
             command=self.thumbnail_canvas.xview,
         )
-        self.thumbnail_inner = tk.Frame(self.thumbnail_canvas, bg=MUSEUM_BG_SURFACE)
-        self.thumbnail_window = self.thumbnail_canvas.create_window((0, 0), window=self.thumbnail_inner, anchor=tk.NW)
-        self.thumbnail_canvas.configure(xscrollcommand=self.thumbnail_scrollbar.set)
+        self.thumbnail_canvas.configure(xscrollcommand=self.on_thumbnail_xscroll)
         self.thumbnail_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
         self.thumbnail_scrollbar.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self.thumbnail_inner.bind("<Configure>", self.on_thumbnail_inner_configure)
         self.thumbnail_canvas.bind("<Configure>", self.on_thumbnail_canvas_configure)
+        self.thumbnail_canvas.bind("<Button-1>", self.on_thumbnail_click)
         self.thumbnail_frame.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
         self.thumbnail_canvas.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
-        self.thumbnail_inner.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
 
         # コンテキストメニュー (右クリック / Museum スタイル)
         self.context_menu = tk.Menu(
@@ -2201,6 +2256,7 @@ finally {{
         if not self.thumbnail_visible:
             self.cancel_thumbnail_highlight()
             self.cancel_thumbnail_follow()
+            self.clear_thumbnail_requests()
         self.request_render(layout=True, image=True, thumbnail_highlight=True)
 
     def toggle_metadata_panel(self):
@@ -2213,76 +2269,110 @@ finally {{
             self.cancel_metadata_refresh()
         self.request_render(layout=True, metadata=True)
 
-    def clear_thumbnail_widgets(self):
-        """既存サムネイルUIを破棄"""
+    # ------------------------------------------------------------------
+    # サムネイル帯 (Canvas 直接描画による仮想化 + ワーカースレッド遅延生成)
+    # ------------------------------------------------------------------
+    def is_thumbnail_strip_active(self):
+        """サムネイル帯が実際に見えている (= 生成依頼を出してよい) か"""
+        return (
+            self.is_slideshow_active
+            and self.thumbnail_visible
+            and not self.panels_hidden_for_resize
+        )
+
+    def ensure_thumbnail_pool(self):
+        """ワーカースレッド群を (未起動なら) 起動して共有 pool を返す"""
+        if self.thumbnail_pool is not None:
+            return self.thumbnail_pool
+        pool = {
+            "lock": threading.Lock(),
+            "pending": [],
+            "inflight": set(),
+            "work": threading.Event(),
+            "stop": threading.Event(),
+            "results": queue.Queue(),
+            "threads": [],
+        }
+        for number in range(THUMBNAIL_WORKER_COUNT):
+            thread = threading.Thread(
+                target=thumbnail_worker_loop,
+                args=(pool,),
+                name=f"thumbnail-worker-{number}",
+                daemon=True,
+            )
+            thread.start()
+            pool["threads"].append(thread)
+        self.thumbnail_pool = pool
+        self.log_timeline(f"thumbnail pool started workers={THUMBNAIL_WORKER_COUNT}")
+        return pool
+
+    def stop_thumbnail_workers(self):
+        """ワーカーを停止して pool を破棄する (次回依頼時に再起動される)"""
+        pool = self.thumbnail_pool
+        self.thumbnail_pool = None
+        if pool is None:
+            return
+        pool["stop"].set()
+        with pool["lock"]:
+            pool["pending"] = []
+            pool["work"].set()
+        # join はしない。遅いストレージや巨大画像のデコード中に UI スレッドを待たせないため。
+        # ワーカーは daemon で、stop を見て自分で終わる。処理中だった結果は旧 pool の
+        # キューに入るだけで、誰にも読まれず捨てられる。
+
+    def clear_thumbnail_requests(self):
+        """未処理のサムネイル生成依頼を全て取り消す"""
+        pool = self.thumbnail_pool
+        if pool is None:
+            return
+        with pool["lock"]:
+            pool["pending"] = []
+
+    def clear_thumbnail_cells(self):
+        """キャンバス上のサムネイル描画アイテムを全て破棄"""
+        self.thumbnail_canvas.delete("all")
+        self.thumbnail_cells = {}
+
+    def cancel_thumbnail_async(self):
+        """サムネイル関連の after 予約を全て取り消す"""
+        for attr in ("thumbnail_poll_after_id", "thumbnail_viewport_after_id", "thumbnail_retry_after_id"):
+            after_id = getattr(self, attr)
+            if after_id:
+                self.root.after_cancel(after_id)
+                setattr(self, attr, None)
+
+    def reset_thumbnail_state(self, stop_workers=False):
+        """世代を進めてキャッシュ・失敗記録・依頼・描画を全て捨てる (フォルダ切替 / メニュー復帰 / 終了用)"""
+        self.thumbnail_generation += 1
         self.cancel_thumbnail_follow()
-        for widget in self.thumbnail_inner.winfo_children():
-            widget.destroy()
-        self.thumbnail_photos = {}
-        self.thumbnail_buttons = {}
-        self.thumbnail_items = {}
-        self.thumbnail_labels = {}
+        self.cancel_thumbnail_async()
+        self.clear_thumbnail_requests()
+        self.thumbnail_cache = OrderedDict()
+        self.thumbnail_failures = {}
+        self.thumbnail_failure_time = {}
+        self.clear_thumbnail_cells()
+        if stop_workers:
+            self.stop_thumbnail_workers()
 
-    def get_thumbnail_photo(self, image_path):
-        """サムネイル画像を必要時だけ生成して返す"""
-        cached_photo = self.thumbnail_photos.get(image_path)
-        if cached_photo is not None:
-            return cached_photo
+    def invalidate_thumbnail(self, image_path):
+        """追加 / 削除 / 上書きされた path のサムネイルキャッシュと失敗記録を捨てる"""
+        self.thumbnail_cache.pop(image_path, None)
+        self.thumbnail_failures.pop(image_path, None)
+        self.thumbnail_failure_time.pop(image_path, None)
 
-        try:
-            with Image.open(image_path) as thumb_image:
-                thumb_image = thumb_image.copy()
-                thumb_image.thumbnail((112, 96), Image.Resampling.LANCZOS)
-        except (OSError, UnidentifiedImageError):
-            thumb_image = Image.new("RGB", (112, 96), color="#444444")
+    def on_thumbnail_xscroll(self, first, last):
+        """キャンバスのスクロール通知 (スクロールバー更新 + 可視範囲の再描画要求)"""
+        self.thumbnail_scrollbar.set(first, last)
+        self.request_thumbnail_viewport_update()
 
-        thumb_photo = ImageTk.PhotoImage(thumb_image)
-        self.thumbnail_photos[image_path] = thumb_photo
-        return thumb_photo
-
-    def add_thumbnail_item(self, index, image_path):
-        """サムネイル帯へ 1 件だけ追加する (Museum スタイル)。"""
-        item_frame = tk.Frame(self.thumbnail_inner, bg=MUSEUM_BG_SURFACE, padx=4, pady=4)
-        item_frame.pack(side=tk.LEFT)
-
-        button = tk.Button(
-            item_frame,
-            image=self.get_thumbnail_photo(image_path),
-            width=116,
-            height=100,
-            bd=2,
-            relief=tk.FLAT,
-            bg=MUSEUM_BG_HOVER,
-            activebackground=MUSEUM_BG_HOVER,
-            highlightthickness=0,
-            cursor='hand2',
-            command=lambda i=index: self.select_image_from_thumbnail(i)
-        )
-        button.pack()
-
-        label = tk.Label(
-            item_frame,
-            text=str(index + 1),
-            bg=MUSEUM_BG_SURFACE,
-            fg=MUSEUM_FG_SECONDARY,
-            font=MUSEUM_FONT_NUMBER,
-        )
-        label.pack(pady=(4, 0))
-
-        for widget in (item_frame, button, label):
-            widget.bind("<Shift-MouseWheel>", self.on_thumbnail_mousewheel)
-
-        self.thumbnail_buttons[image_path] = button
-        self.thumbnail_items[image_path] = item_frame
-        self.thumbnail_labels[image_path] = label
-
-    def on_thumbnail_inner_configure(self, event=None):
-        """サムネイル内側フレームのサイズ変更をキャンバスへ反映"""
-        self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox("all"))
-
-    def on_thumbnail_canvas_configure(self, event):
-        """サムネイルキャンバス幅を内側フレームへ反映"""
-        self.thumbnail_canvas.itemconfigure(self.thumbnail_window, height=event.height)
+    def on_thumbnail_canvas_configure(self, event=None):
+        """サムネイルキャンバスのサイズ変更時に可視範囲を再計算"""
+        self.request_thumbnail_viewport_update()
+        # 帯を初めて開いた直後は、幅が確定するこの時点まで追従スクロールが効かない
+        # (幅 0 の間は scroll_thumbnail_into_view が何もしない) ので、ここで改めて現在画像へ寄せる
+        current_path = self.get_current_image_path()
+        if current_path and self.is_thumbnail_strip_active():
+            self.schedule_thumbnail_follow(current_path)
 
     def on_thumbnail_mousewheel(self, event):
         """Shift+ホイールでサムネイル帯を横スクロール"""
@@ -2292,6 +2382,15 @@ finally {{
         step = -1 if event.delta > 0 else 1
         self.thumbnail_canvas.xview_scroll(step * 3, "units")
 
+    def on_thumbnail_click(self, event):
+        """キャンバスのクリック位置から index を求めて画像を切り替える"""
+        if not self.thumbnail_visible:
+            return
+        canvas_x = self.thumbnail_canvas.canvasx(event.x)
+        if canvas_x < 0:
+            return
+        self.select_image_from_thumbnail(int(canvas_x // THUMBNAIL_CELL_WIDTH))
+
     def select_image_from_thumbnail(self, index):
         """サムネイルクリックで画像を切り替える"""
         if 0 <= index < len(self.image_list):
@@ -2299,20 +2398,257 @@ finally {{
             self.schedule_next_image()
 
     def refresh_thumbnail_strip(self):
-        """画像リストに合わせてサムネイル帯を再構築"""
-        self.clear_thumbnail_widgets()
+        """画像リストの変化をサムネイル帯へ反映 (scrollregion 更新 + 可視範囲の再描画要求)"""
+        count = len(self.image_list)
+        self.thumbnail_canvas.configure(
+            scrollregion=(0, 0, max(1, count * THUMBNAIL_CELL_WIDTH), THUMBNAIL_STRIP_HEIGHT)
+        )
+        # index が変わりうるので描画済みセルは作り直す (可視 + オーバースキャン分だけなので軽い)
+        self.clear_thumbnail_cells()
+        self.request_thumbnail_viewport_update()
 
-        for index, image_path in enumerate(self.image_list):
-            self.add_thumbnail_item(index, image_path)
+    def request_thumbnail_viewport_update(self):
+        """可視範囲の再描画を after_idle で 1 回にまとめて予約"""
+        if self.thumbnail_viewport_after_id is not None:
+            return
+        self.thumbnail_viewport_after_id = self.root.after_idle(self.update_thumbnail_viewport)
 
-        self.highlight_current_thumbnail()
-        self.on_thumbnail_inner_configure()
+    def get_thumbnail_visible_range(self):
+        """現在の可視 index 範囲 (first, last) を返す。算出不能なら None"""
+        count = len(self.image_list)
+        canvas_width = self.thumbnail_canvas.winfo_width()
+        if count <= 0 or canvas_width <= 1:
+            return None
+        left = self.thumbnail_canvas.canvasx(0)
+        first = max(0, int(left // THUMBNAIL_CELL_WIDTH))
+        last = min(count - 1, int((left + canvas_width) // THUMBNAIL_CELL_WIDTH))
+        if first > last:
+            return None
+        return first, last
 
-    def append_thumbnail_item(self, image_path):
-        """末尾追加だけで済む場合にサムネイル帯を差分更新する"""
-        self.add_thumbnail_item(len(self.image_list) - 1, image_path)
-        self.highlight_current_thumbnail()
-        self.on_thumbnail_inner_configure()
+    def get_cached_thumbnail(self, image_path):
+        """sig が現在のスナップショットと一致するキャッシュ済み PhotoImage を返す (LRU touch 付き)"""
+        entry = self.thumbnail_cache.get(image_path)
+        if entry is None:
+            return None
+        if entry[0] != self.folder_snapshot.get(image_path):
+            self.thumbnail_cache.pop(image_path, None)
+            return None
+        self.thumbnail_cache.move_to_end(image_path)
+        return entry[1]
+
+    def draw_thumbnail_cell(self, index):
+        """index のセルをキャンバスへ (再) 描画する。状態が変わっていなければ何もしない"""
+        image_path = self.image_list[index]
+        photo = self.get_cached_thumbnail(image_path)
+        failed = photo is None and self.thumbnail_failures.get(image_path, 0) >= THUMBNAIL_MAX_ATTEMPTS
+        is_current = index == self.current_index
+        state = (id(photo) if photo is not None else None, failed, is_current)
+        existing = self.thumbnail_cells.get(index)
+        if existing is not None:
+            if existing["state"] == state and existing["path"] == image_path:
+                return
+            self.thumbnail_canvas.delete(*existing["ids"])
+
+        canvas = self.thumbnail_canvas
+        x0 = index * THUMBNAIL_CELL_WIDTH
+        box_left = x0 + (THUMBNAIL_CELL_WIDTH - THUMBNAIL_BOX_WIDTH) // 2
+        box_top = 4
+        box_right = box_left + THUMBNAIL_BOX_WIDTH
+        box_bottom = box_top + THUMBNAIL_BOX_HEIGHT
+        if photo is not None:
+            fill = MUSEUM_BG_HOVER
+        elif failed:
+            fill = THUMBNAIL_FAILED_BG
+        else:
+            fill = MUSEUM_BG_INPUT  # 未生成プレースホルダ
+        ids = [
+            canvas.create_rectangle(
+                box_left, box_top, box_right, box_bottom,
+                fill=fill,
+                outline=MUSEUM_ACCENT if is_current else fill,
+                width=2 if is_current else 1,
+            )
+        ]
+        if photo is not None:
+            ids.append(
+                canvas.create_image(
+                    (box_left + box_right) // 2,
+                    (box_top + box_bottom) // 2,
+                    image=photo,
+                    anchor=tk.CENTER,
+                )
+            )
+        ids.append(
+            canvas.create_text(
+                x0 + THUMBNAIL_CELL_WIDTH // 2,
+                box_bottom + 3,
+                text=str(index + 1),
+                fill=MUSEUM_ACCENT if is_current else MUSEUM_FG_SECONDARY,
+                font=MUSEUM_FONT_NUMBER,
+                anchor=tk.N,
+            )
+        )
+        self.thumbnail_cells[index] = {"ids": ids, "state": state, "path": image_path}
+
+    def update_thumbnail_viewport(self):
+        """可視範囲 ± オーバースキャンだけキャンバスアイテムを持たせ、生成依頼リストを更新する"""
+        self.thumbnail_viewport_after_id = None
+        if not self.is_thumbnail_strip_active():
+            self.clear_thumbnail_requests()
+            return
+
+        visible = self.get_thumbnail_visible_range()
+        if visible is None:
+            return
+        start = time.perf_counter()
+        first, last = visible
+        count = len(self.image_list)
+        draw_first = max(0, first - THUMBNAIL_OVERSCAN_CELLS)
+        draw_last = min(count - 1, last + THUMBNAIL_OVERSCAN_CELLS)
+
+        # 範囲外のセルを破棄
+        for index in [i for i in self.thumbnail_cells if i < draw_first or i > draw_last or i >= count]:
+            self.thumbnail_canvas.delete(*self.thumbnail_cells.pop(index)["ids"])
+        # 範囲内のセルを描画 / 更新
+        for index in range(draw_first, draw_last + 1):
+            self.draw_thumbnail_cell(index)
+
+        self.request_thumbnail_generation(first, last)
+        self.log_timeline(
+            f"update_thumbnail_viewport visible={first}-{last} cells={len(self.thumbnail_cells)} "
+            f"cache={len(self.thumbnail_cache)} duration={(time.perf_counter() - start) * 1000:.1f}ms"
+        )
+
+    def request_thumbnail_generation(self, first, last):
+        """可視セル (中央に近い順) → 先読み範囲の順に、未キャッシュ分をワーカー依頼リストとして丸ごと差し替える"""
+        count = len(self.image_list)
+        center = (first + last) / 2
+        prefetch_first = max(0, first - THUMBNAIL_PREFETCH_CELLS)
+        prefetch_last = min(count - 1, last + THUMBNAIL_PREFETCH_CELLS)
+        visible_indices = sorted(range(first, last + 1), key=lambda i: abs(i - center))
+        prefetch_indices = sorted(
+            [i for i in range(prefetch_first, prefetch_last + 1) if i < first or i > last],
+            key=lambda i: abs(i - center),
+        )
+
+        now = time.perf_counter()
+        candidates = []
+        for index in visible_indices + prefetch_indices:
+            image_path = self.image_list[index]
+            sig = self.folder_snapshot.get(image_path)
+            if sig is None:
+                continue
+            entry = self.thumbnail_cache.get(image_path)
+            if entry is not None and entry[0] == sig:
+                continue
+            failures = self.thumbnail_failures.get(image_path, 0)
+            if failures >= THUMBNAIL_MAX_ATTEMPTS:
+                continue
+            if failures and (now - self.thumbnail_failure_time.get(image_path, 0)) * 1000 < THUMBNAIL_RETRY_DELAY_MS:
+                continue
+            candidates.append((image_path, sig, self.thumbnail_generation))
+
+        pool = self.thumbnail_pool
+        if not candidates and pool is None:
+            return
+        pool = self.ensure_thumbnail_pool() if candidates else pool
+
+        # inflight の除外と pending の差し替えは同じ lock の中で行う。
+        # 別々に行うと、その隙間にワーカーが取り出した path を pending へ入れ直してしまい、
+        # 同じ画像を 2 本のワーカーが重複してデコードする。
+        with pool["lock"]:
+            wanted = [item for item in candidates if item[0] not in pool["inflight"]]
+            pool["pending"] = wanted
+            inflight_count = len(pool["inflight"])
+            if wanted:
+                pool["work"].set()
+
+        # 依頼中の結果が残っている間は drain を続ける (止めると inflight が残り続け、
+        # その path が二度と依頼されなくなる)
+        if wanted or inflight_count or not pool["results"].empty():
+            self.ensure_thumbnail_poll()
+        if wanted:
+            self.log_timeline(f"request_thumbnail_generation wanted={len(wanted)} inflight={inflight_count}")
+
+    def ensure_thumbnail_poll(self):
+        """結果キューの drain ポーリングを (止まっていれば) 開始する"""
+        if self.thumbnail_poll_after_id is None and self.thumbnail_pool is not None:
+            self.thumbnail_poll_after_id = self.root.after(THUMBNAIL_POLL_MS, self.poll_thumbnail_results)
+
+    def poll_thumbnail_results(self):
+        """ワーカーの結果を drain し、依頼中 / 未処理がある間だけ自分を再予約する"""
+        self.thumbnail_poll_after_id = None
+        pool = self.thumbnail_pool
+        if pool is None:
+            return
+        try:
+            adopted = self.drain_thumbnail_results(pool)
+            if adopted is not None:
+                self.request_thumbnail_viewport_update()
+        finally:
+            with pool["lock"]:
+                busy = bool(pool["pending"]) or bool(pool["inflight"])
+            if (busy or not pool["results"].empty()) and self.thumbnail_pool is pool:
+                self.thumbnail_poll_after_id = self.root.after(THUMBNAIL_POLL_MS, self.poll_thumbnail_results)
+
+    def drain_thumbnail_results(self, pool):
+        """結果キューから最大 THUMBNAIL_DRAIN_MAX_PER_TICK 件を取り出し PhotoImage 化してキャッシュへ入れる。処理が無ければ None、あれば採用件数を返す。"""
+        handled = 0
+        adopted = 0
+        failed_seen = False
+        strip_active = self.is_thumbnail_strip_active()
+        while handled < THUMBNAIL_DRAIN_MAX_PER_TICK:
+            try:
+                image_path, sig, generation, pil_image = pool["results"].get_nowait()
+            except queue.Empty:
+                break
+            handled += 1
+            with pool["lock"]:
+                pool["inflight"].discard(image_path)
+            # 世代 / スナップショットが現在と一致しない古い結果は捨てる
+            if generation != self.thumbnail_generation or self.folder_snapshot.get(image_path) != sig:
+                continue
+            # 帯を閉じた後に届いた結果 (取り消しが間に合わなかった処理中の分) は採用しない
+            if not strip_active:
+                continue
+            if pil_image is None:
+                self.thumbnail_failures[image_path] = self.thumbnail_failures.get(image_path, 0) + 1
+                self.thumbnail_failure_time[image_path] = time.perf_counter()
+                failed_seen = True
+                continue
+            existing = self.thumbnail_cache.get(image_path)
+            if existing is not None and existing[0] == sig:
+                continue
+            self.thumbnail_cache[image_path] = (sig, ImageTk.PhotoImage(pil_image))
+            self.thumbnail_cache.move_to_end(image_path)
+            adopted += 1
+
+        if adopted:
+            self.evict_thumbnail_cache()
+        if failed_seen and self.thumbnail_retry_after_id is None:
+            self.thumbnail_retry_after_id = self.root.after(THUMBNAIL_RETRY_DELAY_MS, self.retry_thumbnail_failures)
+        if handled:
+            self.log_timeline(f"drain_thumbnail_results handled={handled} adopted={adopted}")
+        # 何か処理した (古い結果の破棄を含む) ときは可視範囲の再評価を促すため非 None を返す
+        return adopted if handled else None
+
+    def retry_thumbnail_failures(self):
+        """失敗したサムネイルの再依頼 (可視範囲の再計算経由)"""
+        self.thumbnail_retry_after_id = None
+        self.request_thumbnail_viewport_update()
+
+    def evict_thumbnail_cache(self):
+        """LRU で古いキャッシュを捨てる。描画中のセルが参照する PhotoImage は残す"""
+        if len(self.thumbnail_cache) <= THUMBNAIL_CACHE_MAX_ITEMS:
+            return
+        drawn_paths = {cell["path"] for cell in self.thumbnail_cells.values()}
+        for image_path in list(self.thumbnail_cache.keys()):
+            if len(self.thumbnail_cache) <= THUMBNAIL_CACHE_MAX_ITEMS:
+                break
+            if image_path in drawn_paths:
+                continue
+            self.thumbnail_cache.pop(image_path, None)
 
     def on_root_configure(self, event=None):
         """ウィンドウサイズ変更時の再描画制御"""
@@ -2369,36 +2705,22 @@ finally {{
         self.end_resize_session()
 
     def highlight_current_thumbnail(self):
-        """現在表示中のサムネイルを強調表示"""
+        """現在表示中のサムネイルを強調表示 (可視セルの描き直しのみ) し、追従スクロールを予約する"""
         current_path = None
         if 0 <= self.current_index < len(self.image_list):
             current_path = self.image_list[self.current_index]
 
-        if not self.thumbnail_visible or not current_path:
+        if not self.is_thumbnail_strip_active() or not current_path:
             self.cancel_thumbnail_follow()
             return
 
-        for image_path, button in self.thumbnail_buttons.items():
-            label = self.thumbnail_labels.get(image_path)
-            if image_path == current_path:
-                # 現在画像: アクセント色枠 + 番号も accent
-                button.config(
-                    relief=tk.SOLID,
-                    bg=MUSEUM_BG_HOVER,
-                    highlightbackground=MUSEUM_ACCENT,
-                    highlightthickness=2,
-                )
-                if label is not None:
-                    label.config(fg=MUSEUM_ACCENT)
-            else:
-                button.config(
-                    relief=tk.FLAT,
-                    bg=MUSEUM_BG_HOVER,
-                    highlightbackground=MUSEUM_BG_SURFACE,
-                    highlightthickness=0,
-                )
-                if label is not None:
-                    label.config(fg=MUSEUM_FG_SECONDARY)
+        # 現在 index が可視範囲内ならこの場で枠を更新。範囲外なら追従スクロール後の再描画に任せる
+        visible = self.get_thumbnail_visible_range()
+        if visible is not None and visible[0] <= self.current_index <= visible[1]:
+            if self.thumbnail_viewport_after_id:
+                self.root.after_cancel(self.thumbnail_viewport_after_id)
+                self.thumbnail_viewport_after_id = None
+            self.update_thumbnail_viewport()
 
         self.schedule_thumbnail_follow(current_path)
 
@@ -2424,23 +2746,29 @@ finally {{
             self.scroll_thumbnail_into_view(path)
 
     def scroll_thumbnail_into_view(self, image_path):
-        """現在画像のサムネイルが見える位置までスクロールする"""
-        item_frame = self.thumbnail_items.get(image_path)
-        if not self.thumbnail_visible or item_frame is None or not item_frame.winfo_exists():
+        """現在画像のセルが中央に来るよう index から算術でスクロール位置を決める"""
+        if not self.is_thumbnail_strip_active():
             return
 
-        inner_width = self.thumbnail_inner.winfo_width()
+        if 0 <= self.current_index < len(self.image_list) and self.image_list[self.current_index] == image_path:
+            index = self.current_index
+        else:
+            index = find_path_index(self.image_list, image_path)
+        if index < 0:
+            return
+
+        total_width = len(self.image_list) * THUMBNAIL_CELL_WIDTH
         canvas_width = self.thumbnail_canvas.winfo_width()
-        if inner_width <= 0 or canvas_width <= 0:
+        if total_width <= 0 or canvas_width <= 1:
             return
 
-        item_x = item_frame.winfo_x()
-        item_width = item_frame.winfo_width()
-        item_center = item_x + (item_width / 2)
-        target_left = item_center - (canvas_width / 2)
-        max_left = max(0, inner_width - canvas_width)
+        item_center = index * THUMBNAIL_CELL_WIDTH + THUMBNAIL_CELL_WIDTH / 2
+        target_left = item_center - canvas_width / 2
+        max_left = max(0, total_width - canvas_width)
         clamped_left = min(max(0, target_left), max_left)
-        self.thumbnail_canvas.xview_moveto(clamped_left / max(1, inner_width))
+        self.thumbnail_canvas.xview_moveto(clamped_left / total_width)
+        # 位置が変わらず scroll 通知が来ない場合でも描画 / 生成依頼を更新する
+        self.request_thumbnail_viewport_update()
 
     def build_metadata_text(self, image_path, image):
         """画像メタ情報を表示用文字列へ整形"""
@@ -3191,23 +3519,9 @@ finally {{
 
         # シーク UI / サムネ帯
         self.update_seekbar_range()
-        only_appended_at_end = (
-            bool(added)
-            and not removed
-            and not modified
-            and len(self.image_list) == previous_count + len(added)
-        )
-        if only_appended_at_end:
-            for path in added:
-                idx = find_path_index(self.image_list, path)
-                if idx == len(self.image_list) - 1:
-                    self.append_thumbnail_item(path)
-                else:
-                    # 中間に入った追加が混ざる場合は安全側で再構築
-                    only_appended_at_end = False
-                    break
-        if not only_appended_at_end:
-            self.refresh_thumbnail_strip()
+        for path in added | removed | modified:
+            self.invalidate_thumbnail(path)
+        self.refresh_thumbnail_strip()
 
         # 再描画要求は現在画像が差し替わった / 消えた場合のみ。
         # 単純な追加だけの場合はサムネ追加・seekbar 更新で必要な反映は完了している。
@@ -3261,6 +3575,7 @@ finally {{
         self.clear_current_image_cache()
         self.cancel_polling()
         self.pending_changes = {}
+        self.reset_thumbnail_state()
         self.load_images_from_folder()
         self.update_seekbar_range()
         self.refresh_thumbnail_strip()
@@ -3360,10 +3675,13 @@ finally {{
         self.resume_play_after_resize = False
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
-        self.cancel_thumbnail_follow()
+        # ワーカーは止めずに使い回す (停止は on_closing のみ)。ここで止めて作り直すと、
+        # 直後に同じフォルダで再開したとき、処理中だった旧ワーカーと新ワーカーが
+        # 同じ画像を重複してデコードする。待機中のワーカーはイベント待ちで負荷にならない。
+        self.reset_thumbnail_state()
         self.set_debug_hud_value("render_status", "idle")
         self.set_debug_hud_value("preview_status", "idle")
-        
+
         # 自動再生のタイマーをキャンセル
         self.cancel_scheduled_image()
 
@@ -3698,7 +4016,7 @@ finally {{
         self.clear_current_image_cache()
         self.cancel_metadata_refresh()
         self.cancel_thumbnail_highlight()
-        self.cancel_thumbnail_follow()
+        self.reset_thumbnail_state(stop_workers=True)
         self.set_debug_hud_value("render_status", "idle")
         self.set_debug_hud_value("preview_status", "idle")
         self.root.destroy()
