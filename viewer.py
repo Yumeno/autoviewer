@@ -7,6 +7,7 @@ import threading
 import time
 import tempfile
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 from collections import OrderedDict
 from PIL import Image, ImageTk, ExifTags, UnidentifiedImageError
@@ -25,8 +26,19 @@ POLL_INTERVAL_MAX_MS = 5000
 # 変わらない期間)。実値は max(POLL_SETTLE_MULTIPLIER * interval, POLL_SETTLE_MIN_MS)。
 POLL_SETTLE_MULTIPLIER = 2
 POLL_SETTLE_MIN_MS = 500
+# 対象フォルダ一覧 (札のデザイン)
+FOLDER_LIST_WIDTH = 548         # 一覧の幅 (px)。内容で伸縮させない
+FOLDER_ROW_HEIGHT = 68          # 1 フォルダ (札) の高さ
+FOLDER_ROW_RIGHT_WIDTH = 196    # 札の右側ブロック (トグル / × / 枚数) の幅
+FOLDER_LIST_MAX_ROWS = 3        # 一覧の最大表示行数の上限 (これを超えると縦スクロール。実際は画面の高さで減る)
+FOLDER_SCROLLBAR_WIDTH = 8      # 一覧の縦スクロール表示の幅
+FOLDER_COUNT_POLL_MS = 100      # 枚数カウント結果キューの確認間隔 (数え中のみ)
 # 単発チェックボタンの 2 回スキャン間隔
 MANUAL_CHECK_GAP_MS = 100
+# 再帰走査の深さ上限 (循環などへの最終防衛。これを超える枝は走査しない)
+RECURSIVE_SCAN_MAX_DEPTH = 64
+# 走査が重いときの間引き: 次回予約間隔を max(設定値, 走査時間 × この倍率) にする
+POLL_SCAN_COST_FACTOR = 5
 
 # ズーム (fit 表示を 1.0x の基準にした相対倍率)
 ZOOM_MIN = 1.0
@@ -300,37 +312,117 @@ def _decode_user_comment(value, endian=None):
     return None
 
 
-def scan_folder_snapshot(folder_path):
-    """フォルダ直下を 1 回だけ scandir で走査してスナップショットを返す。
+def _is_reparse_dir(entry):
+    """ジャンクション (Windows のディレクトリ接合) かどうか。
 
-    戻り値: (snapshot, stat_failed)
+    os.DirEntry.is_junction は Python 3.12+ のみなので、無ければ
+    リパースタグ (IO_REPARSE_TAG_MOUNT_POINT) で判定する。
+    OneDrive のプレースホルダ等、別種のリパースポイントはジャンクション扱いしない。"""
+    is_junction = getattr(entry, "is_junction", None)
+    if is_junction is not None:
+        try:
+            return bool(is_junction())
+        except OSError:
+            return False
+    try:
+        return getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0) == 0xA0000003
+    except OSError:
+        return False
+
+
+_recursive_depth_warned = False
+
+
+def _scan_tree(folder_path, recursive):
+    """scan_folder_snapshot の本体。戻り値の末尾に走査したサブフォルダ数を足して返す。
+
+    recursive=True は os.scandir をスタックで反復して配下をたどる (再帰関数ではない)。
+    シンボリックリンク / ジャンクションはたどらない。
+    """
+    global _recursive_depth_warned
+    snapshot = {}
+    stat_failed = set()
+    failed_dirs = []
+    dir_count = 0
+    stack = [(folder_path, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            it = os.scandir(current)
+        except OSError:
+            if depth == 0:
+                raise  # 最上位フォルダの失敗は呼び出し側へ素通し
+            failed_dirs.append(current)
+            continue
+        try:
+            with it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        stat_failed.add(entry.path)
+                        continue
+                    if is_dir:
+                        if not recursive:
+                            continue
+                        try:
+                            if entry.is_symlink() or _is_reparse_dir(entry):
+                                continue
+                        except OSError:
+                            continue
+                        if depth + 1 > RECURSIVE_SCAN_MAX_DEPTH:
+                            if not _recursive_depth_warned:
+                                _recursive_depth_warned = True
+                                print(f"[scan] 深さ上限 ({RECURSIVE_SCAN_MAX_DEPTH}) を超える階層は走査しません: {entry.path}")
+                            continue
+                        stack.append((entry.path, depth + 1))
+                        dir_count += 1
+                        continue
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext not in SUPPORTED_EXTS:
+                        continue
+                    try:
+                        stat_result = entry.stat()
+                        snapshot[entry.path] = (stat_result.st_mtime_ns, stat_result.st_size)
+                    except OSError:
+                        stat_failed.add(entry.path)
+        except OSError:
+            # 列挙の途中で失敗 (共有切断など)。最上位ならそのまま素通し
+            if depth == 0:
+                raise
+            failed_dirs.append(current)
+    return snapshot, stat_failed, failed_dirs, dir_count
+
+
+def scan_folder_snapshot(folder_path, recursive=False):
+    """フォルダを scandir で走査してスナップショットを返す。
+
+    recursive=False: 直下のみ (従来どおり)。
+    recursive=True:  サブフォルダも全てたどる (シンボリックリンク / ジャンクションは除く)。
+
+    戻り値: (snapshot, stat_failed, failed_dirs)
         snapshot: {path: (mtime_ns, size)} stat に成功した画像
         stat_failed: listdir には見えるが stat に失敗したパス集合
                      呼び出し側は「削除扱いしない / スナップショットは前回値を保つ」と
                      解釈する。
+        failed_dirs: 途中のサブフォルダで scandir に失敗したディレクトリのリスト
 
-    listdir 自体が失敗した場合は OSError を素通しする。呼び出し側は
-    「この poll サイクルをスキップ」と解釈し、状態は一切変更しない。
+    最上位フォルダの listdir 自体が失敗した場合は OSError を素通しする。
+    呼び出し側は「この poll サイクルをスキップ」と解釈し、状態は一切変更しない。
     """
-    snapshot = {}
-    stat_failed = set()
-    with os.scandir(folder_path) as it:
-        for entry in it:
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    continue
-            except OSError:
-                stat_failed.add(entry.path)
-                continue
-            ext = os.path.splitext(entry.name)[1].lower()
-            if ext not in SUPPORTED_EXTS:
-                continue
-            try:
-                stat_result = entry.stat()
-                snapshot[entry.path] = (stat_result.st_mtime_ns, stat_result.st_size)
-            except OSError:
-                stat_failed.add(entry.path)
-    return snapshot, stat_failed
+    snapshot, stat_failed, failed_dirs, _dir_count = _scan_tree(folder_path, recursive)
+    return snapshot, stat_failed, failed_dirs
+
+
+def count_folder_images(folder_path, recursive):
+    """一覧の枚数表示用。戻り値: {'ok': bool, 'images': int, 'dirs': int} (例外は投げない)。
+
+    ワーカースレッドから呼ばれる。Tk には触らない。"""
+    try:
+        snapshot, _failed, _failed_dirs, dir_count = _scan_tree(folder_path, recursive)
+    except OSError:
+        return {'ok': False, 'images': 0, 'dirs': 0}
+    return {'ok': True, 'images': len(snapshot), 'dirs': dir_count}
 
 
 def normalize_folder_key(folder_path):
@@ -338,44 +430,93 @@ def normalize_folder_key(folder_path):
     return os.path.normcase(os.path.normpath(os.path.abspath(folder_path)))
 
 
-def scan_folders_snapshot(folder_paths, previous_snapshot):
-    """複数フォルダ (各フォルダ直下のみ) をまとめて走査してマージしたスナップショットを返す。
+def _is_under_key(key, root_key):
+    """正規化済みの key が root_key の配下 (同一は含まない) か。"""
+    return key.startswith(root_key.rstrip(os.sep) + os.sep) and key != root_key
+
+
+def is_path_covered(path, entries):
+    """path (画像ファイル) がいずれかの対象フォルダエントリの範囲に入っているか。
+
+    非再帰エントリ: 親フォルダがそのフォルダと一致。再帰エントリ: その配下。"""
+    if path is None:
+        return False
+    parent_key = normalize_folder_key(os.path.dirname(path))
+    for entry in entries:
+        root_key = normalize_folder_key(entry['path'])
+        if parent_key == root_key:
+            return True
+        if entry.get('recursive') and _is_under_key(parent_key, root_key):
+            return True
+    return False
+
+
+def scan_folders_snapshot(entries, previous_snapshot):
+    """複数の対象フォルダエントリをまとめて走査してマージしたスナップショットを返す。
+
+    entries: [{'path': str, 'recursive': bool}, ...]
 
     戻り値: (snapshot, stat_failed, failed_folders)
-        snapshot:       {path: (mtime_ns, size)} 全フォルダ分のマージ結果
-        stat_failed:    stat に失敗したパス集合。scandir 自体が失敗したフォルダについては、
-                        previous_snapshot のうちそのフォルダ直下にあるパスを全て含める
+        snapshot:       {path: (mtime_ns, size)} 全エントリ分のマージ結果。
+                        親子フォルダを別々に登録しても、同じファイルは 1 件にまとまる
+        stat_failed:    stat に失敗したパス集合。scandir 自体が失敗したディレクトリ
+                        (最上位フォルダ丸ごと / 途中のサブフォルダ) については、
+                        previous_snapshot のうちその配下にあるパス (深さ問わず) を全て含める
                         (呼び出し側は「削除扱いしない・前回値を持ち越す」と解釈するので、
-                        ネットワーク共有の切断などでそのフォルダの画像が消えない)
-        failed_folders: scandir 自体が失敗したフォルダ (指定された文字列のまま) のリスト
+                        ネットワーク共有の切断などで画像が消えない)。
+                        今回の snapshot に存在するパスは含めない (呼び出し側が
+                        stat_failed を前回値で上書きするため、新しい値が古い値に戻るのを防ぐ)
+        failed_folders: scandir 自体が失敗したディレクトリのリスト
 
     この関数は例外を投げない。
     """
     snapshot = {}
+    seen_keys = set()
+    multi = len(entries) > 1
     stat_failed = set()
     failed_folders = []
     failed_keys = set()
-    for folder in folder_paths:
+    for entry in entries:
+        folder = entry['path']
         try:
-            folder_snapshot, folder_failed = scan_folder_snapshot(folder)
+            part, part_failed, part_failed_dirs = scan_folder_snapshot(
+                folder, bool(entry.get('recursive')),
+            )
         except OSError:
             failed_folders.append(folder)
             failed_keys.add(normalize_folder_key(folder))
             continue
-        snapshot.update(folder_snapshot)
-        stat_failed |= folder_failed
+        if multi:
+            # 親子の重複登録や大文字小文字違いで同じファイルが 2 回入らないよう、
+            # 正規化 (normcase のみ。安価) したキーで 1 件にまとめる
+            for path, value in part.items():
+                key = os.path.normcase(path)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                snapshot[path] = value
+        else:
+            snapshot.update(part)
+        stat_failed |= part_failed
+        for failed_dir in part_failed_dirs:
+            failed_folders.append(failed_dir)
+            failed_keys.add(normalize_folder_key(failed_dir))
     if failed_keys:
         # 正規化 (abspath) は 1 件ごとだと重いので、親フォルダの文字列ごとに 1 回だけ行う。
         # 失敗が続く間は毎周期ここを通るため、枚数に比例したコストを避ける。
+        failed_prefixes = tuple(k.rstrip(os.sep) + os.sep for k in failed_keys)
         parent_failed = {}
         for path in previous_snapshot:
             parent = os.path.dirname(path)
             is_failed = parent_failed.get(parent)
             if is_failed is None:
-                is_failed = normalize_folder_key(parent) in failed_keys
+                parent_key = normalize_folder_key(parent)
+                is_failed = parent_key in failed_keys or (parent_key + os.sep).startswith(failed_prefixes)
                 parent_failed[parent] = is_failed
             if is_failed:
                 stat_failed.add(path)
+    # 今回読めているパスは「失敗」ではない (別エントリ経由で正常に読めた場合など)
+    stat_failed.difference_update(snapshot)
     return snapshot, stat_failed, failed_folders
 
 
@@ -625,12 +766,16 @@ class ImageViewerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("autoviewer")
+        # 初期サイズは設定画面を組み立てた後に _fit_initial_window が決める (ここは仮の値)
         self.root.geometry("680x620")
         self.root.minsize(540, 460)
         self.root.configure(bg=MUSEUM_BG_BASE)
 
         # アプリの状態変数
-        self.folder_paths = []  # 対象フォルダ (指定順)
+        # 対象フォルダ (指定順)。要素は {'path': str, 'recursive': bool}
+        self.folder_entries = []
+        self.folder_list_max_rows = FOLDER_LIST_MAX_ROWS  # 一覧の最大表示行数 (画面の高さに応じて減る)
+        self.last_poll_delay_ms = POLL_INTERVAL_DEFAULT_MS  # 直近に予約したポーリング間隔 (走査が重いと設定値より長い)
         self.last_failed_folders = ()  # 直近のスキャンで失敗したフォルダ (ログの重複抑止用)
         self.last_added_folder = None  # 「追加」ダイアログの initialdir 用
         self.folder_dialog = None  #「対象フォルダ」編集ダイアログ (開いている間のみ)
@@ -1013,6 +1158,35 @@ class ImageViewerApp:
         self.menu_frame = tk.Frame(self.root, bg=MUSEUM_BG_BASE)
         self.menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self._build_settings_screen(self.menu_frame)
+        self._fit_initial_window()
+
+    def _fit_initial_window(self):
+        """起動時のウィンドウサイズを、設定画面 (一覧が最大行数まで埋まった状態) が収まる大きさにする。
+
+        幅 = max(680, 必要幅 + 余白)、高さ = min(必要高さ + 余白, 画面の高さ - 100)。
+        画面が低くて収まらないときは、一覧の最大表示行数を FOLDER_LIST_MAX_ROWS から 1 まで減らす。"""
+        margin_w, margin_h = 80, 40
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        base_height = self.menu_frame.winfo_reqheight()
+        empty_height = self.settings_folder_editor['empty_height']()
+        limit_h = screen_h - 100
+        rows = FOLDER_LIST_MAX_ROWS
+        while rows > 1:
+            need = base_height - empty_height + rows * FOLDER_ROW_HEIGHT + (rows - 1) + margin_h
+            if need <= limit_h:
+                break
+            rows -= 1
+        self.folder_list_max_rows = rows
+        need_h = base_height - empty_height + rows * FOLDER_ROW_HEIGHT + (rows - 1) + margin_h
+        # 縦スクロール表示 (幅 FOLDER_SCROLLBAR_WIDTH) が出た分も幅に含める
+        need_w = self.menu_frame.winfo_reqwidth() + FOLDER_SCROLLBAR_WIDTH + margin_w
+        width = min(max(680, need_w), screen_w)
+        height = max(460, min(need_h, limit_h))
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2 - 20)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def _build_operation_panel(self, parent):
         """Museum テーマの操作パネル本体を組み立てる。
@@ -1339,12 +1513,12 @@ class ImageViewerApp:
         # --- Section: 監視対象フォルダ ---
         self._museum_section_header(content, "対象フォルダ").pack(anchor='w', pady=(0, 8))
 
-        # 設定画面の一覧は self.folder_paths そのものを編集する
-        self.settings_folder_editor = self._build_folder_list_editor(content, self.folder_paths)
+        # 設定画面の一覧は self.folder_entries そのものを編集する
+        self.settings_folder_editor = self._build_folder_list_editor(content, self.folder_entries)
         self.settings_folder_editor['frame'].pack(fill=tk.X, pady=(0, 4))
         tk.Label(
             content,
-            text="複数指定可。全フォルダの画像を更新日時の古い順に混ぜて再生します (各フォルダ直下のみ)",
+            text="全フォルダの画像を、更新日時の古い順に混ぜて再生します",
             bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_DISABLED, font=MUSEUM_FONT_HELP, anchor='w',
         ).pack(anchor='w', pady=(4, 0))
 
@@ -1443,89 +1617,410 @@ class ImageViewerApp:
             justify=tk.CENTER,
         ).pack()
 
-    def _add_folder_to(self, paths, folder):
-        """paths にフォルダを追加する。既に (正規化して) 登録済みなら何もせず False を返す。"""
+    def _add_folder_to(self, entries, folder):
+        """entries にフォルダを追加する (サブフォルダ設定は既定で OFF)。
+        既に (正規化して) 登録済みなら何もせず False を返す。"""
         normalized = os.path.normpath(os.path.abspath(folder))
         key = normalize_folder_key(normalized)
-        if any(normalize_folder_key(p) == key for p in paths):
+        if any(normalize_folder_key(e['path']) == key for e in entries):
             return False
-        paths.append(normalized)
+        entries.append({'path': normalized, 'recursive': False})
         self.last_added_folder = normalized
         return True
 
-    def _build_folder_list_editor(self, parent, paths, dialog_parent=None):
-        """フォルダ一覧 (Listbox) + 「追加」「削除」ボタンを組み立てる。
+    @staticmethod
+    def _ellipsize_middle(text, max_px, font):
+        """text が max_px に収まらなければ中間を「…」で省略する (末尾側を多めに残す)。"""
+        if max_px <= 0 or font.measure(text) <= max_px:
+            return text
+        ellipsis = '…'
+        best = ellipsis
+        lo, hi = 0, len(text)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            head = mid // 3
+            tail = mid - head
+            candidate = text[:head] + ellipsis + (text[len(text) - tail:] if tail > 0 else '')
+            if font.measure(candidate) <= max_px:
+                best = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
 
-        paths (list) をその場で編集する。設定画面とフォルダ編集ダイアログで共通に使う。
-        戻り値: {'frame', 'listbox', 'refresh', 'add', 'remove'}"""
-        frame = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+    def _build_folder_list_editor(self, parent, entries, dialog_parent=None):
+        """対象フォルダの一覧 (1 フォルダ = 1 枚の札) + 「＋ フォルダを追加」行を組み立てる。
 
-        list_frame = tk.Frame(
-            frame, bg=MUSEUM_BG_INPUT,
+        entries (list of {'path', 'recursive'}) をその場で編集する。設定画面と
+        フォルダ編集ダイアログで共通に使う。各札にはサブフォルダの ON/OFF トグル、
+        外す「×」、対象枚数 (ワーカースレッドで数える) を出す。
+
+        戻り値: {'frame', 'entries', 'refresh', 'add', 'remove'(index), 'toggle'(index),
+                 'recount', 'counts', 'close', 'state'}"""
+        list_width = FOLDER_LIST_WIDTH
+        row_height = FOLDER_ROW_HEIGHT
+        right_width = FOLDER_ROW_RIGHT_WIDTH
+        outer = tk.Frame(parent, bg=MUSEUM_BG_BASE)
+        box = tk.Frame(
+            outer, bg=MUSEUM_BG_INPUT,
             highlightthickness=1, highlightbackground=MUSEUM_BORDER,
         )
-        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        box.pack(fill=tk.X)
+        # 一覧が空でも幅が縮まないよう、固定幅のスペーサーを入れておく
+        tk.Frame(box, bg=MUSEUM_BG_INPUT, width=list_width, height=1).pack(side=tk.TOP)
 
-        y_scroll = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
-        x_scroll = tk.Scrollbar(list_frame, orient=tk.HORIZONTAL)
-        listbox = tk.Listbox(
-            list_frame,
-            height=4, width=46,
-            activestyle='none',
-            exportselection=False,
-            selectmode=tk.SINGLE,
-            bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_PRIMARY,
-            selectbackground=MUSEUM_ACCENT, selectforeground=MUSEUM_BG_BASE,
-            font=MUSEUM_FONT_BODY,
-            bd=0, relief=tk.FLAT, highlightthickness=0,
-            yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set,
+        name_font = tkfont.Font(root=self.root, font=('Segoe UI', 11))
+        help_font = tkfont.Font(root=self.root, font=MUSEUM_FONT_HELP)
+
+        list_area = tk.Frame(box, bg=MUSEUM_BG_INPUT)
+        canvas = tk.Canvas(
+            list_area, width=list_width, height=row_height,
+            bg=MUSEUM_BG_INPUT, bd=0, highlightthickness=0,
         )
-        y_scroll.config(command=listbox.yview)
-        x_scroll.config(command=listbox.xview)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
-        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        # 暗いテーマに合わせた細い縦スクロール表示 (tk.Scrollbar は色を変えられないため自前)
+        scrollbar = tk.Canvas(
+            list_area, width=FOLDER_SCROLLBAR_WIDTH, height=1,
+            bg=MUSEUM_BG_INPUT, bd=0, highlightthickness=0, cursor='hand2',
+        )
+        sb = {'first': 0.0, 'last': 1.0, 'hover': False, 'drag': None}
+
+        def sb_draw():
+            scrollbar.delete('all')
+            height = max(1, scrollbar.winfo_height())
+            top = sb['first'] * height
+            bottom = max(top + 20, sb['last'] * height)
+            if bottom > height:
+                top, bottom = max(0, top - (bottom - height)), height
+            color = MUSEUM_FG_SECONDARY if (sb['hover'] or sb['drag'] is not None) else MUSEUM_BORDER
+            scrollbar.create_rectangle(0, top, FOLDER_SCROLLBAR_WIDTH, bottom, fill=color, outline=color, tags='thumb')
+
+        def sb_set(first, last):
+            sb['first'], sb['last'] = float(first), float(last)
+            sb_draw()
+
+        def sb_press(event):
+            height = max(1, scrollbar.winfo_height())
+            span = sb['last'] - sb['first']
+            top = sb['first'] * height
+            bottom = max(top + 20, sb['last'] * height)
+            if top <= event.y <= bottom:
+                sb['drag'] = event.y - top  # つまみ内の掴んだ位置
+            else:
+                # トラックのクリック: クリック位置がつまみの中心になるようジャンプ
+                canvas.yview_moveto(event.y / height - span / 2)
+                sb['drag'] = (sb['last'] - sb['first']) * height / 2
+            sb_draw()
+
+        def sb_motion(event):
+            if sb['drag'] is None:
+                return
+            height = max(1, scrollbar.winfo_height())
+            canvas.yview_moveto((event.y - sb['drag']) / height)
+
+        def sb_release(event):
+            sb['drag'] = None
+            sb_draw()
+
+        def sb_enter(event):
+            sb['hover'] = True
+            sb_draw()
+
+        def sb_leave(event):
+            sb['hover'] = False
+            sb_draw()
+
+        scrollbar.bind('<ButtonPress-1>', sb_press)
+        scrollbar.bind('<B1-Motion>', sb_motion)
+        scrollbar.bind('<ButtonRelease-1>', sb_release)
+        scrollbar.bind('<Enter>', sb_enter)
+        scrollbar.bind('<Leave>', sb_leave)
+        scrollbar.bind('<Configure>', lambda e: sb_draw())
+        scrollbar.bind('<MouseWheel>', lambda e: scroll_wheel(e))
+        canvas.configure(yscrollcommand=sb_set)
+        canvas.pack(side=tk.LEFT)
+        rows_frame = tk.Frame(canvas, bg=MUSEUM_BG_INPUT)
+        canvas.create_window((0, 0), window=rows_frame, anchor='nw', width=list_width)
+        rows_frame.bind(
+            '<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')),
+        )
+
+        empty_label = tk.Label(
+            box, text="フォルダが登録されていません",
+            bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_SECONDARY, font=MUSEUM_FONT_HELP,
+            anchor='w', padx=14, pady=10,
+        )
+
+        state = {'closed': False, 'after': None, 'pending': 0, 'worker': None}
+        counts = {}      # id(entry) -> (path, recursive, result or None)  None = 数え中
+        jobs = queue.Queue()
+        results = queue.Queue()
+        row_widgets = []  # refresh のたびに作り直す: {'entry', 'toggle', 'count'}
+
+        def worker():
+            # ワーカーは Tk に触らない。結果は results キュー経由で UI スレッドが受け取る。
+            while True:
+                job = jobs.get()
+                if job is None:
+                    return
+                key, path, recursive = job
+                results.put((key, path, recursive, count_folder_images(path, recursive)))
+
+        def schedule_poll():
+            if state['after'] is None and not state['closed']:
+                state['after'] = outer.after(FOLDER_COUNT_POLL_MS, poll_results)
+
+        def request_count(entry):
+            if state['worker'] is None:
+                thread = threading.Thread(target=worker, name="folder-count-worker", daemon=True)
+                state['worker'] = thread
+                thread.start()
+            counts[id(entry)] = (entry['path'], bool(entry['recursive']), None)
+            state['pending'] += 1
+            jobs.put((id(entry), entry['path'], bool(entry['recursive'])))
+            schedule_poll()
+
+        def ensure_counts():
+            live = {id(e) for e in entries}
+            for key in [k for k in counts if k not in live]:
+                del counts[key]
+            for entry in entries:
+                cached = counts.get(id(entry))
+                if cached is None or cached[0] != entry['path'] or cached[1] != bool(entry['recursive']):
+                    request_count(entry)
+
+        def poll_results():
+            state['after'] = None
+            if state['closed']:
+                return
+            try:
+                if not outer.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            changed = False
+            while True:
+                try:
+                    key, path, recursive, result = results.get_nowait()
+                except queue.Empty:
+                    break
+                state['pending'] -= 1
+                cached = counts.get(key)
+                # 行が消えた / フラグが変わった後に届いた古い結果は捨てる
+                if cached is not None and cached[2] is None and cached[0] == path and cached[1] == recursive:
+                    counts[key] = (path, recursive, result)
+                    changed = True
+            if changed:
+                update_states()
+            if state['pending'] > 0:
+                schedule_poll()
+
+        def covering_name(entry):
+            """entry のフォルダを配下に含む「サブフォルダ ON」の別エントリの名前 (最も近いもの)。無ければ None。"""
+            key = normalize_folder_key(entry['path'])
+            best = None
+            for other in entries:
+                if other is entry or not other.get('recursive'):
+                    continue
+                other_key = normalize_folder_key(other['path'])
+                if _is_under_key(key, other_key) and (best is None or len(other_key) > len(best[0])):
+                    best = (other_key, other['path'])
+            if best is None:
+                return None
+            return os.path.basename(best[1]) or best[1]
+
+        def update_states():
+            for widgets in row_widgets:
+                entry = widgets['entry']
+                recursive = bool(entry['recursive'])
+                if recursive:
+                    widgets['toggle'].config(
+                        text="サブフォルダ ●",
+                        fg=MUSEUM_ACCENT, activeforeground=MUSEUM_ACCENT_HOVER,
+                    )
+                else:
+                    widgets['toggle'].config(
+                        text="サブフォルダ ○",
+                        fg=MUSEUM_FG_PRIMARY, activeforeground=MUSEUM_FG_PRIMARY,
+                    )
+                label = widgets['count']
+                cover = covering_name(entry)
+                cached = counts.get(id(entry))
+                if cover is not None:
+                    fixed = help_font.measure("「」に含まれています")
+                    shown = self._ellipsize_middle(cover, right_width - fixed, help_font)
+                    label.config(text=f"「{shown}」に含まれています", font=MUSEUM_FONT_HELP, fg=MUSEUM_FG_SECONDARY)
+                    continue
+                label.config(font=MUSEUM_FONT_HELP, fg=MUSEUM_FG_SECONDARY)
+                if cached is None or cached[2] is None:
+                    label.config(text="数えています…")
+                elif not cached[2]['ok']:
+                    label.config(text="読み込めません", fg=MUSEUM_DANGER_HOVER)
+                elif recursive:
+                    label.config(text=f"配下 {cached[2]['images']:,} 枚 / {cached[2]['dirs']:,} フォルダ")
+                else:
+                    label.config(text=f"直下 {cached[2]['images']:,} 枚")
+
+        def scroll_wheel(event):
+            if len(entries) > self.folder_list_max_rows:
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+            return "break"
+
+        def bind_wheel(widget):
+            widget.bind('<MouseWheel>', scroll_wheel)
+            for child in widget.winfo_children():
+                bind_wheel(child)
+
+        def toggle(index):
+            if not 0 <= index < len(entries):
+                return
+            entries[index]['recursive'] = not entries[index]['recursive']
+            ensure_counts()
+            update_states()
+
+        def remove(index=None):
+            if index is None:
+                index = len(entries) - 1
+            if not 0 <= index < len(entries):
+                return
+            del entries[index]
+            refresh()
+
+        def build_row(entry, first):
+            path = entry['path']
+            if not first:
+                tk.Frame(rows_frame, bg=MUSEUM_BORDER, height=1).pack(fill=tk.X)
+            row = tk.Frame(rows_frame, bg=MUSEUM_BG_INPUT, width=list_width, height=row_height)
+            row.pack_propagate(False)
+            row.pack(fill=tk.X)
+
+            right = tk.Frame(row, bg=MUSEUM_BG_INPUT, width=right_width, height=row_height)
+            right.pack_propagate(False)
+            right.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 12))
+            count_label = tk.Label(
+                right, text="", bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_SECONDARY,
+                font=MUSEUM_FONT_HELP, anchor='e',
+            )
+            count_label.pack(side=tk.BOTTOM, anchor='e', pady=(0, 5))
+            top = tk.Frame(right, bg=MUSEUM_BG_INPUT)
+            top.pack(side=tk.TOP, anchor='e', pady=(4, 0))
+            toggle_button = self._museum_button(
+                top, "サブフォルダ ○", lambda e=entry: toggle(entries.index(e)),
+                variant='default', width=14, pady=5,
+            )
+            toggle_button.pack(side=tk.LEFT)
+            # 当たり判定は 40x40px を確保 (タッチ用)。ボタン自体は枠いっぱいに広げる
+            remove_box = tk.Frame(top, bg=MUSEUM_BG_INPUT, width=40, height=40)
+            remove_box.pack_propagate(False)
+            remove_box.pack(side=tk.LEFT, padx=(10, 0))
+            remove_button = tk.Button(
+                remove_box, text="×", command=lambda e=entry: remove(entries.index(e)),
+                bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_SECONDARY,
+                activebackground=MUSEUM_BG_SURFACE, activeforeground=MUSEUM_FG_PRIMARY,
+                relief=tk.FLAT, bd=0, highlightthickness=0, padx=0, pady=0,
+                font=('Segoe UI', 13), cursor='hand2',
+            )
+            remove_button.pack(fill=tk.BOTH, expand=True)
+            remove_button.bind('<Enter>', lambda e, b=remove_button: b.config(fg=MUSEUM_FG_PRIMARY, bg=MUSEUM_BG_SURFACE))
+            remove_button.bind('<Leave>', lambda e, b=remove_button: b.config(fg=MUSEUM_FG_SECONDARY, bg=MUSEUM_BG_INPUT))
+
+            top.update_idletasks()
+            # 左側 (フォルダ名 / 親パス) に使える幅。名前の行はトグルの手前まで、パスの行は枚数表示の手前まで
+            side_margin = 14 + 12 + 10
+            name_budget = list_width - side_margin - top.winfo_reqwidth()
+            path_budget = list_width - side_margin - right_width
+
+            name = os.path.basename(path) or path
+            parent_dir = os.path.dirname(path) if os.path.basename(path) else ''
+            left = tk.Frame(row, bg=MUSEUM_BG_INPUT)
+            left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(14, 0))
+            tk.Label(
+                left, text=self._ellipsize_middle(name, name_budget, name_font),
+                bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_PRIMARY, font=name_font, anchor='w',
+            ).pack(side=tk.TOP, anchor='w', pady=(14, 0))
+            tk.Label(
+                left, text=self._ellipsize_middle(parent_dir, path_budget, help_font),
+                bg=MUSEUM_BG_INPUT, fg=MUSEUM_FG_SECONDARY, font=MUSEUM_FONT_HELP, anchor='w',
+            ).pack(side=tk.TOP, anchor='w', pady=(5, 0))
+
+            row_widgets.append({'entry': entry, 'toggle': toggle_button, 'count': count_label})
+
+        add_separator = tk.Frame(box, bg=MUSEUM_BORDER, height=1)
 
         def refresh():
-            listbox.delete(0, tk.END)
-            if not paths:
-                listbox.insert(tk.END, "フォルダが選択されていません")
-                listbox.itemconfig(0, fg=MUSEUM_FG_SECONDARY, selectforeground=MUSEUM_FG_SECONDARY,
-                                   selectbackground=MUSEUM_BG_INPUT)
-                return
-            for p in paths:
-                listbox.insert(tk.END, p)
+            for child in rows_frame.winfo_children():
+                child.destroy()
+            del row_widgets[:]
+            list_area.pack_forget()
+            empty_label.pack_forget()
+            if entries:
+                for index, entry in enumerate(entries):
+                    build_row(entry, first=(index == 0))
+                visible_rows = min(len(entries), self.folder_list_max_rows)
+                canvas.configure(height=visible_rows * row_height + (visible_rows - 1))
+                if len(entries) > self.folder_list_max_rows:
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                else:
+                    scrollbar.pack_forget()
+                    canvas.yview_moveto(0)
+                list_area.pack(side=tk.TOP, fill=tk.X, before=add_separator)
+                bind_wheel(rows_frame)
+            else:
+                empty_label.pack(side=tk.TOP, fill=tk.X, before=add_separator)
+            ensure_counts()
+            update_states()
 
         def add():
             folder = filedialog.askdirectory(
                 parent=dialog_parent or self.root,
                 initialdir=getattr(self, 'last_added_folder', None) or None,
             )
-            if folder and self._add_folder_to(paths, folder):
+            if folder and self._add_folder_to(entries, folder):
                 refresh()
-                listbox.selection_clear(0, tk.END)
-                listbox.selection_set(len(paths) - 1)
-                listbox.see(len(paths) - 1)
+                if len(entries) > self.folder_list_max_rows:
+                    canvas.update_idletasks()
+                    canvas.yview_moveto(1.0)
 
-        def remove():
-            selection = listbox.curselection()
-            if not selection or not paths:
+        def recount():
+            """全行の枚数を数え直す (設定画面へ戻ったときなど、フォルダの中身が変わっていそうなとき)。"""
+            counts.clear()
+            ensure_counts()
+            update_states()
+
+        add_button = self._museum_button(
+            box, "＋ フォルダを追加", add, variant='accent',
+            anchor='w', padx=14, pady=10, bg=MUSEUM_BG_INPUT, activebackground=MUSEUM_BG_SURFACE,
+        )
+        add_separator.pack(side=tk.TOP, fill=tk.X)
+        add_button.pack(side=tk.TOP, fill=tk.X)
+
+        def close(event=None):
+            if event is not None and event.widget is not outer:
                 return
-            index = selection[0]
-            if index >= len(paths):
+            if state['closed']:
                 return
-            del paths[index]
-            refresh()
-            if paths:
-                listbox.selection_set(min(index, len(paths) - 1))
+            state['closed'] = True
+            if state['after'] is not None:
+                try:
+                    outer.after_cancel(state['after'])
+                except tk.TclError:
+                    pass
+                state['after'] = None
+            # 待機中の数え直しは捨ててワーカーを止める (処理中の 1 件だけは終わるまで走る)
+            try:
+                while True:
+                    jobs.get_nowait()
+            except queue.Empty:
+                pass
+            jobs.put(None)
 
-        buttons = tk.Frame(frame, bg=MUSEUM_BG_BASE)
-        buttons.pack(side=tk.LEFT, padx=(8, 0), anchor='n')
-        self._museum_button(buttons, "追加", add, variant='default', width=8).pack(fill=tk.X)
-        self._museum_button(buttons, "削除", remove, variant='default', width=8).pack(fill=tk.X, pady=(6, 0))
-
+        outer.bind('<Destroy>', close)
         refresh()
-        return {'frame': frame, 'listbox': listbox, 'refresh': refresh, 'add': add, 'remove': remove}
+        return {
+            'frame': outer, 'entries': entries, 'refresh': refresh, 'add': add,
+            'remove': remove, 'toggle': toggle, 'recount': recount, 'counts': counts,
+            'close': close, 'state': state,
+            'empty_height': lambda: empty_label.winfo_reqheight(),
+        }
 
     def format_interval_seconds(self, seconds):
         """表示用に秒数を整形"""
@@ -3270,8 +3765,9 @@ finally {{
     def start_polling(self):
         """ポーリングループを開始する (既存予約は破棄)"""
         self.cancel_polling()
-        if not self.is_slideshow_active or not self.folder_paths or not self.polling_enabled:
+        if not self.is_slideshow_active or not self.folder_entries or not self.polling_enabled:
             return
+        self.last_poll_delay_ms = self.poll_interval_ms
         self.poll_after_id = self.root.after(self.poll_interval_ms, self.poll_folder)
 
     def scan_all_folders(self, label):
@@ -3280,7 +3776,7 @@ finally {{
         戻り値: (snapshot, stat_failed)。scandir に失敗したフォルダの既知パスは
         stat_failed に入っているので、呼び出し側は「削除扱いしない」まま扱える。"""
         snapshot, stat_failed, failed_folders = scan_folders_snapshot(
-            self.folder_paths, self.folder_snapshot,
+            self.folder_entries, self.folder_snapshot,
         )
         failed_key = tuple(sorted(normalize_folder_key(f) for f in failed_folders))
         if failed_key != self.last_failed_folders:
@@ -3378,8 +3874,9 @@ finally {{
     def poll_folder(self):
         """ポーリング 1 周期 (Tk メインスレッドで動作)"""
         self.poll_after_id = None
+        next_delay_ms = self.poll_interval_ms
         try:
-            if not self.is_slideshow_active or not self.folder_paths or not self.polling_enabled:
+            if not self.is_slideshow_active or not self.folder_entries or not self.polling_enabled:
                 return
             # 単発チェック中は auto poll が割り込まないようにスキップ。
             # (manual の phase1 と phase2 の間に folder_snapshot を動かすと
@@ -3389,7 +3886,16 @@ finally {{
 
             # listdir 自体が失敗したフォルダの既知パスは stat_failed に入って返る
             # (ネットワークドライブの瞬断などで、そのフォルダの画像を削除扱いにしない)。
+            scan_started = time.perf_counter()
             current_snapshot, stat_failed = self.scan_all_folders("poll")
+            scan_ms = (time.perf_counter() - scan_started) * 1000.0
+            # 再帰走査などで 1 回の走査が重いときは、走査が占める割合が約 2 割以下になるよう
+            # 次回の予約間隔を延ばす (設定値 poll_interval_ms 自体は変えない)
+            next_delay_ms = max(self.poll_interval_ms, int(scan_ms * POLL_SCAN_COST_FACTOR))
+            if next_delay_ms > self.poll_interval_ms:
+                self.log_timeline(
+                    f"poll interval extended scan_ms={scan_ms:.1f} next_delay_ms={next_delay_ms}"
+                )
 
             stable_snapshot = self.resolve_stable_snapshot(current_snapshot, stat_failed)
             added, removed, modified = diff_snapshots(self.folder_snapshot, stable_snapshot, stat_failed)
@@ -3403,15 +3909,16 @@ finally {{
                 self.apply_folder_diff(added, removed, modified, new_snapshot=new_snapshot)
         finally:
             # 例外が出ても polling は止めない (finally で必ず再予約)
-            if self.is_slideshow_active and self.folder_paths and self.polling_enabled:
-                self.poll_after_id = self.root.after(self.poll_interval_ms, self.poll_folder)
+            if self.is_slideshow_active and self.folder_entries and self.polling_enabled:
+                self.last_poll_delay_ms = next_delay_ms
+                self.poll_after_id = self.root.after(next_delay_ms, self.poll_folder)
 
     def request_manual_check(self):
         """単発の更新チェック。
 
         100ms 間隔で 2 回スキャンし、両方で (mtime_ns, size) が一致したものだけを
         反映する。書き込み途中のファイルは弾く。"""
-        if not self.folder_paths:
+        if not self.folder_entries:
             return
         if self.manual_check_after_id is not None:
             # 既に進行中なら多重起動しない
@@ -3427,7 +3934,7 @@ finally {{
     def _manual_check_phase2(self, first_snapshot, first_failed):
         """単発チェックの 2 回目スキャンと差分反映"""
         self.manual_check_after_id = None
-        if not self.folder_paths:
+        if not self.folder_entries:
             return
 
         second_snapshot, second_failed = self.scan_all_folders("manual_check")
@@ -3669,7 +4176,7 @@ finally {{
         """対象フォルダをスキャンして image_list と folder_snapshot を構築する。"""
         self.image_list = []
         self.folder_snapshot = {}
-        if not self.folder_paths:
+        if not self.folder_entries:
             return
 
         # folder_snapshot は空にしてあるので、失敗フォルダは単に画像 0 件として扱われる
@@ -3722,7 +4229,7 @@ finally {{
         if not self.is_slideshow_active or self.folder_dialog is not None:
             return
 
-        edited = list(self.folder_paths)  # 編集用コピー (「適用」するまで本体は変えない)
+        edited = [dict(e) for e in self.folder_entries]  # 編集用コピー (「適用」するまで本体は変えない)
         result = {'applied': False}
 
         dialog = tk.Toplevel(self.root)
@@ -3740,7 +4247,7 @@ finally {{
         editor['frame'].pack(fill=tk.X)
         tk.Label(
             body,
-            text="全フォルダの画像を更新日時の古い順に混ぜて再生します (各フォルダ直下のみ)",
+            text="全フォルダの画像を、更新日時の古い順に混ぜて再生します",
             bg=MUSEUM_BG_BASE, fg=MUSEUM_FG_DISABLED, font=MUSEUM_FONT_HELP, anchor='w',
         ).pack(anchor='w', pady=(6, 0))
 
@@ -3794,30 +4301,26 @@ finally {{
         except tk.TclError:
             return
 
-        changed = (
-            [normalize_folder_key(p) for p in edited]
-            != [normalize_folder_key(p) for p in self.folder_paths]
-        )
-        if not changed:
+        def signature(entries):
+            return [(normalize_folder_key(e['path']), bool(e.get('recursive'))) for e in entries]
+
+        if signature(edited) == signature(self.folder_entries):
             return
         # 設定画面の一覧ウィジェットが同じリストを参照しているので、in-place で更新する
-        old_keys = {normalize_folder_key(p) for p in self.folder_paths}
-        new_keys = {normalize_folder_key(p) for p in edited}
-        self.folder_paths[:] = edited
+        old_signature = set(signature(self.folder_entries))
+        new_signature = set(signature(edited))
+        self.folder_entries[:] = edited
         self.settings_folder_editor['refresh']()
-        if old_keys == new_keys:
-            return
+        if old_signature == new_signature:
+            return  # 並び順だけの変更。再生には影響しない
 
-        # 表示中の画像のフォルダが残っているなら、差分として反映して再生位置を保つ
-        # (フォルダを足しただけで先頭へ戻されないように)。即時チェックの 2 回スキャンに
-        # 乗せることで、外したフォルダの画像は削除、足したフォルダの画像は追加として
-        # apply_folder_diff を通る。
+        # 表示中の画像が新しい構成の対象範囲に残っているなら、差分として反映して再生位置を保つ
+        # (フォルダを足しただけ / サブフォルダ設定を変えただけで先頭へ戻されないように)。
+        # 即時チェックの 2 回スキャンに乗せることで、外した範囲の画像は削除、足した範囲の
+        # 画像は追加として apply_folder_diff を通る。
         current_path = self.get_current_image_path()
-        current_folder_kept = (
-            current_path is not None
-            and normalize_folder_key(os.path.dirname(current_path)) in new_keys
-        )
-        if current_folder_kept:
+        current_kept = current_path is not None and is_path_covered(current_path, self.folder_entries)
+        if current_kept:
             if self.manual_check_after_id is not None:
                 # 進行中の即時チェックは旧フォルダ構成の 1 回目を持っているので捨てる
                 self.root.after_cancel(self.manual_check_after_id)
@@ -3840,7 +4343,7 @@ finally {{
 
     def start_slideshow(self):
         """スライドショーの開始"""
-        if not self.folder_paths:
+        if not self.folder_entries:
             messagebox.showwarning("警告", "フォルダを選択してください。")
             return
         
@@ -3921,6 +4424,8 @@ finally {{
         self.cancel_pending_single_tap()
         self.update_delete_button_state()
         self.request_render(layout=True)
+        # 設定画面に戻ったので、再生中に変わったかもしれない各フォルダの枚数を数え直す
+        self.settings_folder_editor['recount']()
 
     def on_escape(self, event=None):
         """再生中は Esc でフルスクリーン表示を切り替える"""
